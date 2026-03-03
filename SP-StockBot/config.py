@@ -36,15 +36,32 @@ class Config:
     GROQ_MODEL: str = "llama-3.1-8b-instant"  # Fast & low token usage
 
     # ==================== GOOGLE DRIVE ====================
-    GOOGLE_SERVICE_ACCOUNT_PATH: str = os.getenv(
-        "GOOGLE_SERVICE_ACCOUNT_PATH", "./service_account.json"
-    )
     GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str] = os.getenv(
         "GOOGLE_SERVICE_ACCOUNT_JSON", None
     )
     GOOGLE_DRIVE_FOLDER_ID: str = os.getenv(
         "GOOGLE_DRIVE_FOLDER_ID", ""
     )
+    
+    @classmethod
+    def _auto_detect_service_account(cls) -> Optional[str]:
+        """Auto-detect service account JSON file location."""
+        candidate_paths = [
+            Path("./nth-station-489109-s1-6c5ccb8ccef4.json"),
+            Path("./SP-StockBot/nth-station-489109-s1-6c5ccb8ccef4.json"),
+            Path(os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH", "./service_account.json")),
+        ]
+        
+        for path in candidate_paths:
+            if path.exists():
+                abs_path = str(path.resolve())
+                from logger import activity_logger
+                activity_logger.logger.info(f"✓ Auto-detected service account at {abs_path}")
+                return abs_path
+        
+        return os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH", "./service_account.json")
+    
+    GOOGLE_SERVICE_ACCOUNT_PATH: str = _auto_detect_service_account(None)
 
     # ==================== APPLICATION ====================
     APP_ENV: str = os.getenv("APP_ENV", "development")
@@ -96,25 +113,43 @@ class Config:
         """
         Get Google service account credentials.
         Supports both JSON file and JSON string in .env.
+        Auto-detects service account JSON file if not explicitly configured.
         """
+        # First try JSON string in environment
         if cls.GOOGLE_SERVICE_ACCOUNT_JSON:
             try:
-                return json.loads(cls.GOOGLE_SERVICE_ACCOUNT_JSON)
+                from logger import activity_logger
+                result = json.loads(cls.GOOGLE_SERVICE_ACCOUNT_JSON)
+                activity_logger.logger.info("✓ Loaded service account from GOOGLE_SERVICE_ACCOUNT_JSON env var")
+                return result
             except json.JSONDecodeError:
                 raise ValueError(
                     "Invalid JSON in GOOGLE_SERVICE_ACCOUNT_JSON"
                 )
 
-        if Path(cls.GOOGLE_SERVICE_ACCOUNT_PATH).exists():
+        # Then try to load from file (auto-detected or configured path)
+        service_account_path = cls.GOOGLE_SERVICE_ACCOUNT_PATH
+        if service_account_path and Path(service_account_path).exists():
             try:
-                with open(cls.GOOGLE_SERVICE_ACCOUNT_PATH) as f:
-                    return json.load(f)
+                with open(service_account_path) as f:
+                    result = json.load(f)
+                    from logger import activity_logger
+                    activity_logger.logger.info(f"✓ Loaded service account from {service_account_path}")
+                    return result
             except (json.JSONDecodeError, IOError) as e:
                 raise ValueError(
                     f"Failed to load service account from "
-                    f"{cls.GOOGLE_SERVICE_ACCOUNT_PATH}: {e}"
+                    f"{service_account_path}: {e}"
                 )
 
+        # Not found - provide helpful error message
+        from logger import activity_logger
+        activity_logger.logger.warning(
+            "Google service account credentials not found. "
+            "Set GOOGLE_SERVICE_ACCOUNT_JSON env var or place JSON file at: "
+            "./nth-station-489109-s1-6c5ccb8ccef4.json or "
+            "./SP-StockBot/nth-station-489109-s1-6c5ccb8ccef4.json"
+        )
         raise ValueError(
             "Google service account credentials not found. "
             "Set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_PATH"

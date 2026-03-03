@@ -43,8 +43,14 @@ class LineWebhookSimulator:
         user_id: str,
         event_type: str = "message",
     ) -> Dict[str, Any]:
-        """Create a Line webhook event."""
+        """Create a Line webhook event (v3 SDK format)."""
+        # SDK v3 requires these fields
         return {
+            "mode": "active",
+            "webhookEventId": "00000000000000000000000000000000",
+            "deliveryContext": {
+                "isRedelivery": False,
+            },
             "events": [
                 {
                     "type": event_type,
@@ -59,6 +65,7 @@ class LineWebhookSimulator:
                         "userId": user_id,
                     },
                     "replyToken": f"nHuyWiB7yP5Zw52FIkcQT",
+                    "mode": "active",
                 }
             ]
         }

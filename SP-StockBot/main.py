@@ -9,14 +9,21 @@ import logging
 import sys
 from datetime import datetime
 from typing import Dict, Any, Optional
+from contextlib import asynccontextmanager
 
 import psutil
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, ImageSendMessage
+
+# Line Bot SDK v3
+from linebot.v3.messaging import MessagingApi, ApiClient, TextMessage, ImageMessage
+from linebot.v3.webhook import WebhookHandler, MessageEvent
+from linebot.v3.webhook import TextMessageContent, ImageMessageContent
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.client import Configuration
+from linebot.models import TextSendMessage, ImageSendMessage
+
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import Config
@@ -29,11 +36,91 @@ from logger import activity_logger
 from commands.admin_commands import AdminCommands
 from commands.employee_commands import EmployeeCommands
 
+# Background scheduler (initialized before app for use in lifespan)
+scheduler = BackgroundScheduler()
+
+
+# Lifespan context manager for FastAPI startup/shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle startup and shutdown events with asynccontextmanager."""
+    # ==================== STARTUP ====================
+    try:
+        # Run startup validation first
+        if not validate_startup():
+            activity_logger.log_error(
+                "Startup validation failed. Server cannot start.",
+                error_type="startup_validation_error",
+            )
+            sys.exit(1)
+
+        # Initialize components
+        get_db()
+        get_groq_agent()
+        get_admin_commands()
+        get_employee_commands()
+        get_drive_handler()
+
+        # Start scheduler
+        if not scheduler.running:
+            scheduler.add_job(
+                daily_anomaly_check,
+                "cron",
+                hour=8,
+                minute=0,
+                id="daily_anomaly_check",
+            )
+            scheduler.add_job(
+                memory_cleanup,
+                "interval",
+                minutes=30,
+                id="memory_cleanup",
+            )
+            scheduler.add_job(
+                check_drive_for_new_files,
+                "interval",
+                minutes=15,
+                id="check_drive_files",
+            )
+            scheduler.start()
+
+        activity_logger.logger.info("✓ SP-StockBot started successfully")
+
+    except Exception as e:
+        activity_logger.log_error(
+            f"Startup error: {e}",
+            error_type="startup_error",
+        )
+        sys.exit(1)
+
+    # Server is running - yield control back to FastAPI
+    yield
+
+    # ==================== SHUTDOWN ====================
+    try:
+        if scheduler.running:
+            scheduler.shutdown()
+
+        db_instance = get_db()
+        if db_instance:
+            db_instance.close()
+
+        gc.collect()
+        activity_logger.logger.info("✓ SP-StockBot shutdown gracefully")
+
+    except Exception as e:
+        activity_logger.log_error(
+            f"Shutdown error: {e}",
+            error_type="shutdown_error",
+        )
+
+
 # Initialize FastAPI app
 app = FastAPI(
     title="SP-StockBot",
     description="Internal Line Bot for Automobile Repair Shop Inventory",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Add CORS middleware
@@ -45,8 +132,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Line Bot SDK
-line_bot_api = LineBotApi(Config.LINE_CHANNEL_ACCESS_TOKEN)
+# Initialize Line Bot SDK v3
+configuration = Configuration(access_token=Config.LINE_CHANNEL_ACCESS_TOKEN)
+api_client = ApiClient(configuration=configuration)
+line_bot_api = MessagingApi(api_client)
 webhook_handler = WebhookHandler(Config.LINE_CHANNEL_SECRET)
 
 # Initialize components (lazy loaded)
@@ -57,9 +146,6 @@ xlsx_parser: Optional[XlsxParser] = None
 anomaly_detector: Optional[AnomalyDetector] = None
 admin_commands: Optional[AdminCommands] = None
 employee_commands: Optional[EmployeeCommands] = None
-
-# Background scheduler
-scheduler = BackgroundScheduler()
 
 
 def get_db() -> Database:
@@ -277,6 +363,8 @@ def validate_startup() -> bool:
     Validate all dependencies before startup.
     Returns True if all checks pass, False otherwise.
     """
+    from pathlib import Path
+    
     print("\n" + "=" * 60)
     print("[STARTUP] SP-StockBot Startup Validation")
     print("=" * 60)
@@ -284,8 +372,37 @@ def validate_startup() -> bool:
     checks_passed = 0
     checks_failed = 0
 
+    # 0. Check Python version
+    print("\n[0/7] Checking Python version...")
+    py_version = sys.version_info
+    print(f"  Running on Python {py_version.major}.{py_version.minor}.{py_version.micro}")
+    activity_logger.logger.info(f"Python version: {sys.version}")
+    if py_version.major >= 3 and py_version.minor >= 10:
+        print("  OK Python 3.10+ ✓")
+        checks_passed += 1
+    else:
+        print(f"  FAIL Python 3.10+ required, got {py_version.major}.{py_version.minor}")
+        checks_failed += 1
+
+    # 0.5. Check service account file
+    print("\n[0.5/7] Checking Google service account file...")
+    candidate_paths = [
+        Path("./nth-station-489109-s1-6c5ccb8ccef4.json"),
+        Path("./SP-StockBot/nth-station-489109-s1-6c5ccb8ccef4.json"),
+    ]
+    service_account_found = False
+    for path in candidate_paths:
+        if path.exists():
+            print(f"  OK Found service account at {path.resolve()} ✓")
+            activity_logger.logger.info(f"Service account detected: {path.resolve()}")
+            service_account_found = True
+            checks_passed += 1
+            break
+    if not service_account_found:
+        print("  SKIP Service account not found (Drive will be unavailable)")
+
     # 1. Check imports
-    print("\n[1/6] Checking critical imports...")
+    print("\n[1/7] Checking critical imports...")
     try:
         import fastapi
         print("  OK fastapi")
@@ -336,7 +453,7 @@ def validate_startup() -> bool:
         checks_failed += 1
 
     # 2. Check configuration
-    print("\n[2/6] Checking configuration...")
+    print("\n[2/7] Checking configuration...")
     config_errors = Config.validate()
     if config_errors:
         print("  FAIL Configuration validation failed:")
@@ -348,7 +465,7 @@ def validate_startup() -> bool:
         checks_passed += 1
 
     # 3. Check database
-    print("\n[3/6] Checking database...")
+    print("\n[3/7] Checking database...")
     try:
         test_db = Database()
         # Try to create a test table
@@ -360,7 +477,7 @@ def validate_startup() -> bool:
         checks_failed += 1
 
     # 4. Check Groq client
-    print("\n[4/6] Checking Groq API client...")
+    print("\n[4/7] Checking Groq API client...")
     try:
         test_groq = GroqAgent(test_db)
         print(f"  OK Groq client initialized (model: {Config.GROQ_MODEL})")
@@ -370,7 +487,7 @@ def validate_startup() -> bool:
         print(f"    -> This will be retried at startup")
 
     # 5. Check Line Bot handler
-    print("\n[5/6] Checking Line Bot configuration...")
+    print("\n[5/7] Checking Line Bot configuration...")
     try:
         assert Config.LINE_CHANNEL_SECRET, "LINE_CHANNEL_SECRET not set"
         assert Config.LINE_CHANNEL_ACCESS_TOKEN, "LINE_CHANNEL_ACCESS_TOKEN not set"
@@ -381,7 +498,7 @@ def validate_startup() -> bool:
         checks_failed += 1
 
     # 6. Check Drive service (optional)
-    print("\n[6/6] Checking Google Drive service...")
+    print("\n[6/7] Checking Google Drive service...")
     try:
         if Config.GOOGLE_DRIVE_FOLDER_ID or Config.GOOGLE_SERVICE_ACCOUNT_JSON:
             test_drive = DriveHandler()
@@ -407,81 +524,6 @@ def validate_startup() -> bool:
         print("FAILED: STARTUP VALIDATION FAILED - Fix errors above before starting")
         print("=" * 60 + "\n")
         return False
-
-
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    """Initialize on startup."""
-    # Run startup validation first
-    if not validate_startup():
-        activity_logger.log_error(
-            "Startup validation failed. Server cannot start.",
-            error_type="startup_validation_error",
-        )
-        sys.exit(1)
-
-    try:
-        # Initialize components
-        get_db()
-        get_groq_agent()
-        get_admin_commands()
-        get_employee_commands()
-        get_drive_handler()
-
-        # Start scheduler
-        if not scheduler.running:
-            scheduler.add_job(
-                daily_anomaly_check,
-                "cron",
-                hour=8,
-                minute=0,
-                id="daily_anomaly_check",
-            )
-            scheduler.add_job(
-                memory_cleanup,
-                "interval",
-                minutes=30,
-                id="memory_cleanup",
-            )
-            scheduler.add_job(
-                check_drive_for_new_files,
-                "interval",
-                minutes=15,
-                id="check_drive_files",
-            )
-            scheduler.start()
-
-        activity_logger.logger.info("✓ SP-StockBot started successfully")
-
-    except Exception as e:
-        activity_logger.log_error(
-            f"Startup error: {e}",
-            error_type="startup_error",
-        )
-        sys.exit(1)
-
-
-# Shutdown event
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown."""
-    try:
-        if scheduler.running:
-            scheduler.shutdown()
-
-        db_instance = get_db()
-        if db_instance:
-            db_instance.close()
-
-        gc.collect()
-        activity_logger.logger.info("✓ SP-StockBot shutdown gracefully")
-
-    except Exception as e:
-        activity_logger.log_error(
-            f"Shutdown error: {e}",
-            error_type="shutdown_error",
-        )
 
 
 # Health check endpoint
@@ -537,7 +579,7 @@ async def line_webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail="Internal error")
 
 
-@webhook_handler.add(MessageEvent, message=TextMessage)
+@webhook_handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event: MessageEvent):
     """Handle text message from Line."""
     try:

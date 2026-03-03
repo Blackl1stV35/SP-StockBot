@@ -132,7 +132,7 @@ class LineWebhookSimulator:
         test_cases = [
             # Employee commands
             {
-                "description": "Employee: Help command (ช่วย)",
+                "description": "Employee: Help command (Thai text message)",
                 "message": "ช่วย",
                 "user_id": self.test_user_id,
             },
@@ -142,7 +142,7 @@ class LineWebhookSimulator:
                 "user_id": self.test_user_id,
             },
             {
-                "description": "Employee: Check stock (Thai)",
+                "description": "Employee: Check stock (Thai text)",
                 "message": "สตอก ทรายอ่อน",
                 "user_id": self.test_user_id,
             },
@@ -152,7 +152,7 @@ class LineWebhookSimulator:
                 "user_id": self.test_user_id,
             },
             {
-                "description": "Employee: Report usage (Thai)",
+                "description": "Employee: Report usage (Thai text)",
                 "message": "ใช้ ทรายอ่อน 5",
                 "user_id": self.test_user_id,
             },
@@ -178,7 +178,7 @@ class LineWebhookSimulator:
                 "user_id": self.super_admin_user_id,
             },
             {
-                "description": "Admin: Help command",
+                "description": "Admin: Help command (Thai text)",
                 "message": "ช่วย",
                 "user_id": self.super_admin_user_id,
             },

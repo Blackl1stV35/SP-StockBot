@@ -272,10 +272,155 @@ def check_drive_for_new_files():
         )
 
 
+def validate_startup() -> bool:
+    """
+    Validate all dependencies before startup.
+    Returns True if all checks pass, False otherwise.
+    """
+    print("\n" + "=" * 60)
+    print("[STARTUP] SP-StockBot Startup Validation")
+    print("=" * 60)
+
+    checks_passed = 0
+    checks_failed = 0
+
+    # 1. Check imports
+    print("\n[1/6] Checking critical imports...")
+    try:
+        import fastapi
+        print("  OK fastapi")
+        checks_passed += 1
+    except ImportError as e:
+        print(f"  FAIL fastapi: {e}")
+        checks_failed += 1
+
+    try:
+        import linebot
+        print("  OK line-bot-sdk")
+        checks_passed += 1
+    except ImportError as e:
+        print(f"  FAIL line-bot-sdk: {e}")
+        checks_failed += 1
+
+    try:
+        import groq
+        print("  OK groq")
+        checks_passed += 1
+    except ImportError as e:
+        print(f"  FAIL groq: {e}")
+        checks_failed += 1
+
+    try:
+        import googleapiclient.discovery
+        print("  OK googleapiclient")
+        checks_passed += 1
+    except ImportError as e:
+        print(f"  FAIL googleapiclient: {e}")
+        print(f"    -> Suggestion: pip install google-api-python-client>=2.100")
+        checks_failed += 1
+
+    try:
+        import google.oauth2.service_account
+        print("  OK google-auth")
+        checks_passed += 1
+    except ImportError as e:
+        print(f"  FAIL google-auth: {e}")
+        checks_failed += 1
+
+    try:
+        import pandas
+        print("  OK pandas")
+        checks_passed += 1
+    except ImportError as e:
+        print(f"  FAIL pandas: {e}")
+        checks_failed += 1
+
+    # 2. Check configuration
+    print("\n[2/6] Checking configuration...")
+    config_errors = Config.validate()
+    if config_errors:
+        print("  FAIL Configuration validation failed:")
+        for error in config_errors:
+            print(f"    -> {error}")
+        checks_failed += len(config_errors)
+    else:
+        print("  OK All required config keys set")
+        checks_passed += 1
+
+    # 3. Check database
+    print("\n[3/6] Checking database...")
+    try:
+        test_db = Database()
+        # Try to create a test table
+        test_db.get_all_users()
+        print("  OK SQLite database connected")
+        checks_passed += 1
+    except Exception as e:
+        print(f"  FAIL Database error: {e}")
+        checks_failed += 1
+
+    # 4. Check Groq client
+    print("\n[4/6] Checking Groq API client...")
+    try:
+        test_groq = GroqAgent(test_db)
+        print(f"  OK Groq client initialized (model: {Config.GROQ_MODEL})")
+        checks_passed += 1
+    except Exception as e:
+        print(f"  WARN Groq client warning: {e}")
+        print(f"    -> This will be retried at startup")
+
+    # 5. Check Line Bot handler
+    print("\n[5/6] Checking Line Bot configuration...")
+    try:
+        assert Config.LINE_CHANNEL_SECRET, "LINE_CHANNEL_SECRET not set"
+        assert Config.LINE_CHANNEL_ACCESS_TOKEN, "LINE_CHANNEL_ACCESS_TOKEN not set"
+        print("  OK Line Bot handler registered")
+        checks_passed += 1
+    except AssertionError as e:
+        print(f"  FAIL Line Bot config: {e}")
+        checks_failed += 1
+
+    # 6. Check Drive service (optional)
+    print("\n[6/6] Checking Google Drive service...")
+    try:
+        if Config.GOOGLE_DRIVE_FOLDER_ID or Config.GOOGLE_SERVICE_ACCOUNT_JSON:
+            test_drive = DriveHandler()
+            print("  OK Google Drive service initialized")
+            checks_passed += 1
+        else:
+            print("  SKIP Drive integration not configured (optional)")
+    except Exception as e:
+        print(f"  WARN Drive service warning: {e}")
+        print("    -> (Drive features will be disabled, but bot will continue)")
+
+    # Summary
+    print("\n" + "=" * 60)
+    print(f"  PASS: {checks_passed}")
+    print(f"  FAIL: {checks_failed}")
+    print("=" * 60)
+
+    if checks_failed == 0:
+        print("SUCCESS: STARTUP VALIDATION PASSED - Ready to start!")
+        print("=" * 60 + "\n")
+        return True
+    else:
+        print("FAILED: STARTUP VALIDATION FAILED - Fix errors above before starting")
+        print("=" * 60 + "\n")
+        return False
+
+
 # Startup event
 @app.on_event("startup")
 async def startup_event():
     """Initialize on startup."""
+    # Run startup validation first
+    if not validate_startup():
+        activity_logger.log_error(
+            "Startup validation failed. Server cannot start.",
+            error_type="startup_validation_error",
+        )
+        sys.exit(1)
+
     try:
         # Initialize components
         get_db()

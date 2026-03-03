@@ -29,6 +29,7 @@ class GroqAgent:
         if not Config.GROQ_API_KEY:
             raise ValueError("GROQ_API_KEY not set in environment")
 
+        # Initialize Groq client with minimal parameters for compatibility
         self.client = Groq(api_key=Config.GROQ_API_KEY)
         self.model = Config.GROQ_MODEL
         self.db = db

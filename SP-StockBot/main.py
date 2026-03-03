@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 
 # Line Bot SDK v3
-from linebot.v3.messaging import MessagingApi, ApiClient, TextMessage
+from linebot.v3.messaging import MessagingApi, ApiClient, TextMessage, ReplyMessageRequest
 from linebot.v3.webhook import WebhookHandler, MessageEvent
 from linebot.v3.exceptions import InvalidSignatureError
 
@@ -587,192 +587,201 @@ async def line_webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail="Internal error")
 
 
-# v3 decorator: TextMessage filter ensures ONLY text messages reach this handler
-@webhook_handler.add(MessageEvent, message=TextMessage)
+# Official v3 pattern using ReplyMessageRequest wrapper
+@webhook_handler.add(MessageEvent)
 def handle_message(event: MessageEvent):
-    """Handle text messages from Line."""
+    """
+    Handle ALL incoming messages - check type inside.
+    Uses official v3 ReplyMessageRequest pattern.
+    """
     try:
-        user_id = event.source.user_id
-        user_message = event.message.text.strip()
+        # Check if message is text
+        if isinstance(event.message, TextMessage):
+            # === TEXT MESSAGE HANDLING ===
+            user_id = event.source.user_id
+            user_message = event.message.text.strip()
 
-        activity_logger.log_message_received(
-            user_id=user_id,
-            raw_message=user_message,
-        )
-
-        db_instance = get_db()
-        agent = get_groq_agent()
-        admin_cmd = get_admin_commands()
-        emp_cmd = get_employee_commands()
-
-        user = db_instance.get_user(user_id)
-        is_admin = user is not None and user.get("role") == "super_admin"
-        is_registered = user is not None
-
-        if not is_registered:
-            reply_text = (
-                "👋 ยินดีต้อนรับสู่ SP-StockBot!\n\n"
-                "กรุณาขอให้แอดมินเพิ่มคุณในระบบก่อนนะครับ\n"
-                "แอดมินใช้คำสั่ง: Add user [ชื่อ] PIN:[รหัส]"
+            activity_logger.log_message_received(
+                user_id=user_id,
+                raw_message=user_message,
             )
-            messaging_api.reply_message(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)]
-            )
-            return
 
-        # Classify intent using Groq
-        intent_result = agent.classify_intent(
-            user_message=user_message,
-            user_name=user.get("display_name", "User"),
-            is_admin=is_admin,
-        )
+            db_instance = get_db()
+            agent = get_groq_agent()
+            admin_cmd = get_admin_commands()
+            emp_cmd = get_employee_commands()
 
-        intent = intent_result.get("intent", "other")
-        requires_pin = intent_result.get("requires_pin", False)
-        reply_text = intent_result.get("reply_text", "")
+            user = db_instance.get_user(user_id)
+            is_admin = user is not None and user.get("role") == "super_admin"
+            is_registered = user is not None
 
-        # Route to appropriate handler
-        if intent == "admin_command" or (is_admin and intent != "help"):
-            # Admin command - check PIN first
-            provided_pin = agent.extract_pin_from_message(user_message)
-
-            if requires_pin and not provided_pin:
+            if not is_registered:
                 reply_text = (
-                    "🔐 PIN required for this command.\n"
-                    "Usage: [command] PIN:xxxx"
+                    "👋 ยินดีต้อนรับสู่ SP-StockBot!\n\n"
+                    "กรุณาขอให้แอดมินเพิ่มคุณในระบบก่อนนะครับ\n"
+                    "แอดมินใช้คำสั่ง: Add user [ชื่อ] PIN:[รหัส]"
                 )
                 messaging_api.reply_message(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text)]
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)]
+                    )
                 )
                 return
 
-            if provided_pin and not agent.verify_pin(
-                provided_pin, Config.SUPER_ADMIN_PIN
-            ):
-                reply_text = "❌ PIN incorrect. Command rejected."
-                messaging_api.reply_message(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text)]
+            # Classify intent using Groq
+            intent_result = agent.classify_intent(
+                user_message=user_message,
+                user_name=user.get("display_name", "User"),
+                is_admin=is_admin,
+            )
+
+            intent = intent_result.get("intent", "other")
+            requires_pin = intent_result.get("requires_pin", False)
+            reply_text = intent_result.get("reply_text", "")
+
+            # Route to appropriate handler
+            if intent == "admin_command" or (is_admin and intent != "help"):
+                # Admin command - check PIN first
+                provided_pin = agent.extract_pin_from_message(user_message)
+
+                if requires_pin and not provided_pin:
+                    reply_text = (
+                        "🔐 PIN required for this command.\n"
+                        "Usage: [command] PIN:xxxx"
+                    )
+                    messaging_api.reply_message(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text=reply_text)]
+                        )
+                    )
+                    return
+
+                if provided_pin and not agent.verify_pin(
+                    provided_pin, Config.SUPER_ADMIN_PIN
+                ):
+                    reply_text = "❌ PIN incorrect. Command rejected."
+                    messaging_api.reply_message(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text=reply_text)]
+                        )
+                    )
+                    activity_logger.log_admin_action(
+                        admin_line_id=user_id,
+                        action="pin_attempt",
+                        pin_verified=False,
+                    )
+                    return
+
+                # Extract command details
+                cmd_name, params = admin_cmd.extract_command_details(
+                    user_message
                 )
+
+                if cmd_name == "add_user":
+                    display_name = params.get("display_name", "")
+                    success, msg = admin_cmd.add_user(
+                        display_name=display_name,
+                        excel_name=params.get("excel_name", display_name),
+                        role="employee",
+                    )
+                    reply_text = msg
+
+                elif cmd_name == "list_users":
+                    reply_text = admin_cmd.list_users(
+                        role=params.get("role")
+                    )
+
+                elif cmd_name == "delete_user":
+                    user_id_del = params.get("user_id", "")
+                    success, msg = admin_cmd.delete_user(user_id_del)
+                    reply_text = msg
+
+                elif cmd_name == "set_drive":
+                    folder_id = params.get("drive_folder_id", "")
+                    success, msg = admin_cmd.set_drive_folder(folder_id)
+                    reply_text = msg
+
+                elif cmd_name == "help":
+                    reply_text = admin_cmd.get_help_text(is_admin=True)
+
+                else:
+                    reply_text = admin_cmd.get_help_text(is_admin=True)
+
                 activity_logger.log_admin_action(
                     admin_line_id=user_id,
-                    action="pin_attempt",
-                    pin_verified=False,
-                )
-                return
-
-            # Extract command details
-            cmd_name, params = admin_cmd.extract_command_details(
-                user_message
-            )
-
-            if cmd_name == "add_user":
-                display_name = params.get("display_name", "")
-                success, msg = admin_cmd.add_user(
-                    display_name=display_name,
-                    excel_name=params.get("excel_name", display_name),
-                    role="employee",
-                )
-                reply_text = msg
-
-            elif cmd_name == "list_users":
-                reply_text = admin_cmd.list_users(
-                    role=params.get("role")
+                    action=cmd_name or "unknown",
+                    pin_verified=bool(provided_pin),
+                    success=True,
                 )
 
-            elif cmd_name == "delete_user":
-                user_id_del = params.get("user_id", "")
-                success, msg = admin_cmd.delete_user(user_id_del)
-                reply_text = msg
+            elif intent == "check_stock":
+                material = intent_result.get("parameters", {}).get("material", "")
+                reply_text = emp_cmd.check_inventory(user_id, material)
 
-            elif cmd_name == "set_drive":
-                folder_id = params.get("drive_folder_id", "")
-                success, msg = admin_cmd.set_drive_folder(folder_id)
-                reply_text = msg
+            elif intent == "report_usage":
+                material = intent_result.get("parameters", {}).get("material", "")
+                qty = intent_result.get("parameters", {}).get("quantity", 0)
+                if material and qty:
+                    reply_text = emp_cmd.report_usage(user_id, material, qty)
+                else:
+                    reply_text = (
+                        "Please specify material and quantity.\n"
+                        "Usage: ใช้ [material] [qty]"
+                    )
 
-            elif cmd_name == "help":
-                reply_text = admin_cmd.get_help_text(is_admin=True)
+            elif intent == "help":
+                if is_admin:
+                    reply_text = admin_cmd.get_help_text(is_admin=True)
+                else:
+                    reply_text = emp_cmd.get_help_text()
 
-            else:
-                reply_text = admin_cmd.get_help_text(is_admin=True)
-
-            activity_logger.log_admin_action(
-                admin_line_id=user_id,
-                action=cmd_name or "unknown",
-                pin_verified=bool(provided_pin),
-                success=True,
-            )
-
-        elif intent == "check_stock":
-            material = intent_result.get("parameters", {}).get("material", "")
-            reply_text = emp_cmd.check_inventory(user_id, material)
-
-        elif intent == "report_usage":
-            material = intent_result.get("parameters", {}).get("material", "")
-            qty = intent_result.get("parameters", {}).get("quantity", 0)
-            if material and qty:
-                reply_text = emp_cmd.report_usage(user_id, material, qty)
             else:
                 reply_text = (
-                    "Please specify material and quantity.\n"
-                    "Usage: ใช้ [material] [qty]"
+                    "❓ Unknown command.\n"
+                    "Use: Help / ช่วย\n\n"
+                    "Or ask: สตอก [item] / ใช้ [item] [qty]"
                 )
 
-        elif intent == "help":
-            if is_admin:
-                reply_text = admin_cmd.get_help_text(is_admin=True)
-            else:
-                reply_text = emp_cmd.get_help_text()
-
-        else:
-            reply_text = (
-                "❓ Unknown command.\n"
-                "Use: Help / ช่วย\n\n"
-                "Or ask: สตอก [item] / ใช้ [item] [qty]"
+            # Final reply – ReplyMessageRequest wrapper pattern
+            messaging_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text or "ได้รับข้อความแล้วครับ")]
+                )
             )
 
-    # Final reply – always use this pattern
-        messaging_api.reply_message(
-            reply_token=event.reply_token,
-            messages=[TextMessage(text=reply_text or "ได้รับข้อความแล้วครับ")]
-        )
+            activity_logger.log_message_processed(
+                user_id=user_id,
+                intent=intent,
+                action_result="success",
+            )
 
-        activity_logger.log_message_processed(
-            user_id=user_id,
-            intent=intent,
-            action_result="success",
-        )
+        else:
+            # === NON-TEXT MESSAGE FALLBACK ===
+            messaging_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="📎 กรุณาส่งข้อความตัวหนังสือเท่านั้นนะครับ")]
+                )
+            )
 
     except Exception as e:
         activity_logger.log_error(
-            f"Error handling text message: {e}",
-            error_type="text_handler_error",
+            f"Error in message handler: {e}",
+            error_type="message_handler_error",
         )
         try:
             messaging_api.reply_message(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text="⚠️ มีข้อผิดพลาดในการประมวลผล กรุณาลองใหม่นะครับ")]
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="⚠️ มีข้อผิดพลาดในการประมวลผล กรุณาลองใหม่นะครับ")]
+                )
             )
         except:
             pass
-
-
-# v3 decorator: NO message= filter means this catches ALL non-text MessageEvents (images, stickers, locations, etc.)
-@webhook_handler.add(MessageEvent)
-def handle_other_message(event: MessageEvent):
-    """Handle non-text messages (images, stickers, locations, etc.)."""
-    try:
-        messaging_api.reply_message(
-            reply_token=event.reply_token,
-            messages=[TextMessage(text="📎 กรุณาส่งข้อความตัวหนังสือเท่านั้นนะครับ")]
-        )
-    except Exception as e:
-        activity_logger.log_error(
-            f"Error in non-text handler: {e}",
-            error_type="non_text_handler_error",
-        )
 
 # Admin API endpoints (optional, for debugging)
 @app.get("/api/anomalies", tags=["Admin"])

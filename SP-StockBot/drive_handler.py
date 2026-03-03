@@ -37,14 +37,23 @@ class DriveHandler:
             )
 
             self.service = build("drive", "v3", credentials=credentials)
-            activity_logger.logger.info("✓ Google Drive authenticated")
+            activity_logger.logger.info("✓ Google Drive authenticated successfully")
 
+        except ValueError as e:
+            # Service account not found - Drive will be unavailable but startup continues
+            activity_logger.logger.warning(
+                f"Google Drive credentials not configured: {e}. "
+                "Drive features will be unavailable, but app will continue."
+            )
+            self.service = None
+            
         except Exception as e:
+            # Other auth errors - log but don't crash
             activity_logger.log_error(
                 f"Failed to authenticate Google Drive: {e}",
                 error_type="drive_auth_error",
             )
-            raise
+            self.service = None
 
     def create_folder_structure(self, parent_folder_id: str) -> Dict[str, str]:
         """
@@ -55,6 +64,12 @@ class DriveHandler:
           └── Archives/
         Returns mapping of folder names to IDs.
         """
+        if not self.service:
+            activity_logger.logger.warning(
+                "Google Drive not authenticated. Folder structure not created."
+            )
+            return {}
+        
         try:
             folders = {}
 
@@ -117,6 +132,12 @@ class DriveHandler:
         Upload file to Google Drive.
         Returns file ID if successful, None otherwise.
         """
+        if not self.service:
+            activity_logger.logger.warning(
+                "Google Drive not authenticated. File upload skipped."
+            )
+            return None
+        
         try:
             if not os.path.exists(file_path):
                 raise FileNotFoundError(f"File not found: {file_path}")
@@ -157,6 +178,12 @@ class DriveHandler:
         Download file from Google Drive.
         Returns True if successful, False otherwise.
         """
+        if not self.service:
+            activity_logger.logger.warning(
+                "Google Drive not authenticated. File download skipped."
+            )
+            return False
+        
         try:
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -228,6 +255,12 @@ class DriveHandler:
 
     def find_latest_xlsx(self, folder_id: str) -> Optional[Dict[str, Any]]:
         """Find the most recently uploaded .xlsx file."""
+        if not self.service:
+            activity_logger.logger.warning(
+                "Google Drive not authenticated. Cannot find xlsx files."
+            )
+            return None
+        
         try:
             files = self.list_files(folder_id, file_type="xlsx", limit=1)
             if files:

@@ -20,7 +20,7 @@ if __name__ == "__main__":
     print(f"\n[PYTHON] Running on Python {sys.version}")
     python_version = sys.version_info
     if python_version.major == 3 and python_version.minor >= 10:
-        print(f"  OK Python {python_version.major}.{python_version.minor}.{python_version.micro} ✓")
+        print(f"  OK Python {python_version.major}.{python_version.minor}.{python_version.micro} (OK)")
     else:
         print(f"  ERROR: Python 3.10+ required, got {python_version.major}.{python_version.minor}")
         sys.exit(1)
@@ -35,7 +35,7 @@ if __name__ == "__main__":
     service_account_found = False
     for path in candidate_paths:
         if path.exists():
-            print(f"  OK Found at {path.resolve()} ✓")
+            print(f"  OK Found at {path.resolve()} (SERVICE ACCOUNT DETECTED)")
             service_account_found = True
             break
     
@@ -109,7 +109,7 @@ if __name__ == "__main__":
         
         if validation_passed:
             print("\n" + "=" * 60)
-            print("✓ SUCCESS: VALIDATION PASSED!")
+            print("SUCCESS: VALIDATION PASSED  (OK)")
             print("=" * 60)
             print("\nYou can now start the bot:")
             print("  python SP-StockBot/main.py")
@@ -119,7 +119,7 @@ if __name__ == "__main__":
             sys.exit(0)
         else:
             print("\n" + "=" * 60)
-            print("✗ FAILED: VALIDATION FAILED")
+            print("FAILED: VALIDATION FAILED")
             print("=" * 60)
             print("\nFix the errors above and try again.\n")
             sys.exit(1)

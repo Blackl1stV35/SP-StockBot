@@ -17,12 +17,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 
 # Line Bot SDK v3
-from linebot.v3.messaging import MessagingApi, ApiClient, TextMessage, ImageMessage
+from linebot.v3.messaging import MessagingApi, ApiClient, TextMessage
 from linebot.v3.webhook import WebhookHandler, MessageEvent
-from linebot.v3.webhook import TextMessageContent, ImageMessageContent
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.client import Configuration
-from linebot.models import TextSendMessage, ImageSendMessage
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -133,9 +130,8 @@ app.add_middleware(
 )
 
 # Initialize Line Bot SDK v3
-configuration = Configuration(access_token=Config.LINE_CHANNEL_ACCESS_TOKEN)
-api_client = ApiClient(configuration=configuration)
-line_bot_api = MessagingApi(api_client)
+api_client = ApiClient(access_token=Config.LINE_CHANNEL_ACCESS_TOKEN)
+messaging_api = MessagingApi(api_client)
 webhook_handler = WebhookHandler(Config.LINE_CHANNEL_SECRET)
 
 # Initialize components (lazy loaded)
@@ -234,11 +230,11 @@ def daily_anomaly_check():
 
             # Send to super admin
             try:
-                message = TextSendMessage(
+                message = TextMessage(
                     text=f"📋 Daily Anomaly Report:\n\n{summary}"
                 )
-                line_bot_api.push_message(
-                    Config.LINE_SUPER_ADMIN_ID, message
+                messaging_api.push_message(
+                    Config.LINE_SUPER_ADMIN_ID, {"messages": [message.as_json_dict()]}
                 )
                 activity_logger.logger.info(
                     f"✓ Sent anomaly report to admin: {len(unnotified)} anomalies"
@@ -339,8 +335,8 @@ def check_drive_for_new_files():
         if result["errors"]:
             reply += f"Errors: {len(result['errors'])}\n"
 
-        message = TextSendMessage(text=reply)
-        line_bot_api.push_message(Config.LINE_SUPER_ADMIN_ID, message)
+        message = TextMessage(text=reply)
+        messaging_api.push_message(Config.LINE_SUPER_ADMIN_ID, {"messages": [message.as_json_dict()]})
 
         activity_logger.logger.info(f"✓ Processed {file_name}")
 
@@ -491,7 +487,9 @@ def validate_startup() -> bool:
     try:
         assert Config.LINE_CHANNEL_SECRET, "LINE_CHANNEL_SECRET not set"
         assert Config.LINE_CHANNEL_ACCESS_TOKEN, "LINE_CHANNEL_ACCESS_TOKEN not set"
-        print("  OK Line Bot handler registered")
+        # Verify API client initialization
+        _ = MessagingApi(ApiClient(access_token=Config.LINE_CHANNEL_ACCESS_TOKEN))
+        print("  OK Line Bot SDK v3 handler configured")
         checks_passed += 1
     except AssertionError as e:
         print(f"  FAIL Line Bot config: {e}")
@@ -579,10 +577,14 @@ async def line_webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail="Internal error")
 
 
-@webhook_handler.add(MessageEvent, message=TextMessageContent)
+@webhook_handler.add(MessageEvent, message=TextMessage)
 def handle_message(event: MessageEvent):
     """Handle text message from Line."""
     try:
+        # Type check for text messages
+        if not isinstance(event.message, TextMessage):
+            return
+        
         user_id = event.source.user_id
         user_message = event.message.text.strip()
 
@@ -610,9 +612,9 @@ def handle_message(event: MessageEvent):
                 "Please ask the admin to add you to the system.\n"
                 "Admin: Use 'Add user [name] PIN:[code]' to register employees."
             )
-            line_bot_api.reply_message(
+            messaging_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=reply_text),
+                {"messages": [{"type": "text", "text": reply_text}]},
             )
             return
 
@@ -637,9 +639,9 @@ def handle_message(event: MessageEvent):
                     "🔐 PIN required for this command.\n"
                     "Usage: [command] PIN:xxxx"
                 )
-                line_bot_api.reply_message(
+                messaging_api.reply_message(
                     event.reply_token,
-                    TextSendMessage(text=reply_text),
+                    {"messages": [{"type": "text", "text": reply_text}]},
                 )
                 return
 
@@ -647,9 +649,9 @@ def handle_message(event: MessageEvent):
                 provided_pin, Config.SUPER_ADMIN_PIN
             ):
                 reply_text = "❌ PIN incorrect. Command rejected."
-                line_bot_api.reply_message(
+                messaging_api.reply_message(
                     event.reply_token,
-                    TextSendMessage(text=reply_text),
+                    {"messages": [{"type": "text", "text": reply_text}]},
                 )
                 activity_logger.log_admin_action(
                     admin_line_id=user_id,
@@ -729,9 +731,9 @@ def handle_message(event: MessageEvent):
             )
 
         # Send reply
-        line_bot_api.reply_message(
+        messaging_api.reply_message(
             event.reply_token,
-            TextSendMessage(text=reply_text),
+            {"messages": [{"type": "text", "text": reply_text}]},
         )
 
         # Log action
@@ -748,11 +750,9 @@ def handle_message(event: MessageEvent):
         )
 
         try:
-            line_bot_api.reply_message(
+            messaging_api.reply_message(
                 event.reply_token,
-                TextSendMessage(
-                    text="⚠️ Error processing message. Please try again."
-                ),
+                {"messages": [{"type": "text", "text": "⚠️ Error processing message. Please try again."}]},
             )
         except:
             pass
@@ -762,9 +762,9 @@ def handle_message(event: MessageEvent):
 def handle_other_message(event: MessageEvent):
     """Handle non-text messages."""
     try:
-        line_bot_api.reply_message(
+        messaging_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="📝 Please send text messages only."),
+            {"messages": [{"type": "text", "text": "📝 Please send text messages only."}]},
         )
     except Exception as e:
         activity_logger.log_error(

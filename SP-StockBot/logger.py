@@ -123,6 +123,40 @@ class ActivityLogger:
             extra=extra,
         )
 
+    def log_message_received(
+        self,
+        user_id: str,
+        raw_message: str,
+    ) -> None:
+        """Log incoming message received (simplified wrapper for log_user_message)."""
+        extra = {
+            "user_id": user_id,
+            "raw_msg": raw_message,
+            "memory": self._get_memory_info(),
+        }
+        self.logger.info(
+            f"Message received: {user_id} | {raw_message[:50]}...",
+            extra=extra,
+        )
+
+    def log_message_processed(
+        self,
+        user_id: str,
+        intent: str,
+        action_result: str = "success",
+    ) -> None:
+        """Log message processing completed."""
+        extra = {
+            "user_id": user_id,
+            "intent": intent,
+            "action_result": action_result,
+            "memory": self._get_memory_info(),
+        }
+        self.logger.info(
+            f"Message processed: {user_id} | Intent: {intent} | Result: {action_result}",
+            extra=extra,
+        )
+
     def log_error(
         self,
         error_msg: str,

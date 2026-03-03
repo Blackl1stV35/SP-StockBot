@@ -664,9 +664,10 @@ def handle_message(event: MessageEvent):
                     )
                 )
                 activity_logger.log_admin_action(
-                    admin_line_id=user_id,
+                    admin_id=user_id,
                     action="pin_attempt",
-                    pin_verified=False,
+                    pin_result="failed",
+                    success=False,
                 )
                 return
 
@@ -706,9 +707,9 @@ def handle_message(event: MessageEvent):
                 reply_text = admin_cmd.get_help_text(is_admin=True)
 
             activity_logger.log_admin_action(
-                admin_line_id=user_id,
+                admin_id=user_id,
                 action=cmd_name or "unknown",
-                pin_verified=bool(provided_pin),
+                pin_result="verified" if provided_pin else "not_required",
                 success=True,
             )
 

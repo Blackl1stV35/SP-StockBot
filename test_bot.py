@@ -113,11 +113,11 @@ class LineWebhookSimulator:
             return status, text, body
 
         except httpx.ConnectError:
-            print("\n❌ ERROR: Cannot connect to webhook. Is uvicorn running?")
+            print("\n[ERROR] Cannot connect to webhook. Is uvicorn running?")
             print(f"   Make sure server is running: python SP-StockBot/main.py")
             return 0, "Connection failed", body
         except Exception as e:
-            print(f"\n❌ ERROR: {type(e).__name__}: {e}")
+            print(f"\n[ERROR] {type(e).__name__}: {e}")
             return 0, str(e), body
 
     def run_all_tests(self) -> Dict[str, Any]:
@@ -214,11 +214,11 @@ class LineWebhookSimulator:
 
                 # Success = 200 OK
                 if status == 200:
-                    print(f"✅ SUCCESS (status {status})")
+                    print(f"[OK] SUCCESS (status {status})")
                     results["passed"] += 1
                     test_result["status"] = "PASS"
                 else:
-                    print(f"⚠️  WARNING (status {status})")
+                    print(f"[WARN] WARNING (status {status})")
                     results["failed"] += 1
                     test_result["status"] = "FAIL"
 
@@ -228,7 +228,7 @@ class LineWebhookSimulator:
                 }
 
             except Exception as e:
-                print(f"❌ ERROR: {e}")
+                print(f"[ERROR] {e}")
                 results["failed"] += 1
                 results["errors"].append(str(e))
                 test_result["status"] = "ERROR"
@@ -245,15 +245,15 @@ class LineWebhookSimulator:
         print(f"TEST SUMMARY")
         print(f"{'='*70}")
         print(f"Total:   {len(test_cases)}")
-        print(f"Passed:  {results['passed']} ✅")
-        print(f"Failed:  {results['failed']} ❌")
+        print(f"Passed:  {results['passed']} [OK]")
+        print(f"Failed:  {results['failed']} [ERROR]")
         print(f"Duration: {duration:.2f}s")
         print(f"{'='*70}\n")
 
         # Print detailed results
         print("DETAILED RESULTS:\n")
         for test in results["tests"]:
-            status_icon = "✅" if test["status"] == "PASS" else "❌" if test["status"] == "FAIL" else "⚠️"
+            status_icon = "[OK]" if test["status"] == "PASS" else "[ERR]" if test["status"] == "FAIL" else "[WARN]"
             print(f"{status_icon} Test {test['num']}: {test['description']}")
             print(f"   Message: {test['message']}")
             print(f"   Status:  {test['status']}")
@@ -274,19 +274,19 @@ class LineWebhookSimulator:
             )
             if response.status_code == 200:
                 health = response.json()
-                print(f"✅ Server is running")
+                print(f"[OK] Server is running")
                 print(f"   Status: {health.get('status')}")
                 print(f"   Memory: {health.get('memory_mb', 0):.1f} MB")
                 return True
             else:
-                print(f"⚠️  Server health check returned {response.status_code}")
+                print(f"[WARN] Server health check returned {response.status_code}")
                 return False
         except httpx.ConnectError:
-            print("❌ Cannot connect to server at http://localhost:8000")
+            print("[ERROR] Cannot connect to server at http://localhost:8000")
             print("   Make sure uvicorn is running: python SP-StockBot/main.py")
             return False
         except Exception as e:
-            print(f"❌ Health check error: {e}")
+            print(f"[ERROR] Health check error: {e}")
             return False
 
 
@@ -329,7 +329,7 @@ def main():
     # Check server status first
     print("Checking server status...")
     if not simulator.check_server_status():
-        print("\n⚠️  Server not available. Cannot run tests.")
+        print("\n[WARN] Server not available. Cannot run tests.")
         return 1
 
     print()

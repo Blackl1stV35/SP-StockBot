@@ -14,19 +14,40 @@ ENV_FILE = Path(__file__).parent / ".env"
 load_dotenv(ENV_FILE)
 
 
+def _auto_detect_service_account() -> Optional[str]:
+    """Auto-detect service account JSON file location."""
+    candidate_paths = [
+        Path("./nth-station-489109-s1-6c5ccb8ccef4.json"),
+        Path("./SP-StockBot/nth-station-489109-s1-6c5ccb8ccef4.json"),
+        Path(os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH", "./service_account.json")),
+    ]
+
+    for path in candidate_paths:
+        if path.exists() and path.is_file():
+            abs_path = str(path.resolve())
+            # Delayed import to avoid circular import issues
+            try:
+                from logger import activity_logger
+                activity_logger.logger.info(f"[OK] Auto-detected service account at {abs_path}")
+            except ImportError:
+                print(f"[OK] Auto-detected service account at {abs_path} (logger not available yet)")
+            return abs_path
+
+    # Fallback
+    fallback = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH", None)
+    if fallback and Path(fallback).exists():
+        return fallback
+
+    return None
+
+
 class Config:
     """Application configuration."""
 
     # ==================== LINE MESSAGING API ====================
-    LINE_CHANNEL_SECRET: str = os.getenv(
-        "LINE_CHANNEL_SECRET", ""
-    )
-    LINE_CHANNEL_ACCESS_TOKEN: str = os.getenv(
-        "LINE_CHANNEL_ACCESS_TOKEN", ""
-    )
-    LINE_SUPER_ADMIN_ID: str = os.getenv(
-        "LINE_SUPER_ADMIN_ID", ""
-    )
+    LINE_CHANNEL_SECRET: str = os.getenv("LINE_CHANNEL_SECRET", "")
+    LINE_CHANNEL_ACCESS_TOKEN: str = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+    LINE_SUPER_ADMIN_ID: str = os.getenv("LINE_SUPER_ADMIN_ID", "")
 
     # ==================== SECURITY ====================
     SUPER_ADMIN_PIN: str = os.getenv("SUPER_ADMIN_PIN", "7482")
@@ -39,29 +60,10 @@ class Config:
     GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str] = os.getenv(
         "GOOGLE_SERVICE_ACCOUNT_JSON", None
     )
-    GOOGLE_DRIVE_FOLDER_ID: str = os.getenv(
-        "GOOGLE_DRIVE_FOLDER_ID", ""
-    )
-    
-    @classmethod
-    def _auto_detect_service_account(cls) -> Optional[str]:
-        """Auto-detect service account JSON file location."""
-        candidate_paths = [
-            Path("./nth-station-489109-s1-6c5ccb8ccef4.json"),
-            Path("./SP-StockBot/nth-station-489109-s1-6c5ccb8ccef4.json"),
-            Path(os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH", "./service_account.json")),
-        ]
-        
-        for path in candidate_paths:
-            if path.exists():
-                abs_path = str(path.resolve())
-                from logger import activity_logger
-                activity_logger.logger.info(f"✓ Auto-detected service account at {abs_path}")
-                return abs_path
-        
-        return os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH", "./service_account.json")
-    
-    GOOGLE_SERVICE_ACCOUNT_PATH: str = _auto_detect_service_account(None)
+    GOOGLE_DRIVE_FOLDER_ID: str = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
+
+    # Auto-detected path (computed once at module level)
+    GOOGLE_SERVICE_ACCOUNT_PATH: str = _auto_detect_service_account() or ""
 
     # ==================== APPLICATION ====================
     APP_ENV: str = os.getenv("APP_ENV", "development")
@@ -70,9 +72,7 @@ class Config:
     APP_WORKERS: int = int(os.getenv("APP_WORKERS", "1"))
 
     # ==================== DATABASE ====================
-    DATABASE_PATH: str = os.getenv(
-        "DATABASE_PATH", "./data/stockbot.db"
-    )
+    DATABASE_PATH: str = os.getenv("DATABASE_PATH", "./data/stockbot.db")
 
     # Create data directory if it doesn't exist
     DB_DIR = Path(DATABASE_PATH).parent
@@ -98,22 +98,15 @@ class Config:
     ENABLE_DAILY_SUMMARY: bool = (
         os.getenv("ENABLE_DAILY_SUMMARY", "true").lower() == "true"
     )
-    DAILY_SUMMARY_HOUR: int = int(
-        os.getenv("DAILY_SUMMARY_HOUR", "17")
-    )
-    WEEKLY_SUMMARY_DAY: int = int(
-        os.getenv("WEEKLY_SUMMARY_DAY", "0")
-    )  # 0 = Monday
-    WEEKLY_SUMMARY_HOUR: int = int(
-        os.getenv("WEEKLY_SUMMARY_HOUR", "17")
-    )
+    DAILY_SUMMARY_HOUR: int = int(os.getenv("DAILY_SUMMARY_HOUR", "17"))
+    WEEKLY_SUMMARY_DAY: int = int(os.getenv("WEEKLY_SUMMARY_DAY", "0"))  # 0 = Monday
+    WEEKLY_SUMMARY_HOUR: int = int(os.getenv("WEEKLY_SUMMARY_HOUR", "17"))
 
     @classmethod
     def get_google_service_account(cls) -> dict:
         """
         Get Google service account credentials.
         Supports both JSON file and JSON string in .env.
-        Auto-detects service account JSON file if not explicitly configured.
         """
         # First try JSON string in environment
         if cls.GOOGLE_SERVICE_ACCOUNT_JSON:
@@ -122,37 +115,32 @@ class Config:
                 result = json.loads(cls.GOOGLE_SERVICE_ACCOUNT_JSON)
                 activity_logger.logger.info("✓ Loaded service account from GOOGLE_SERVICE_ACCOUNT_JSON env var")
                 return result
-            except json.JSONDecodeError:
-                raise ValueError(
-                    "Invalid JSON in GOOGLE_SERVICE_ACCOUNT_JSON"
-                )
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON in GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
 
         # Then try to load from file (auto-detected or configured path)
         service_account_path = cls.GOOGLE_SERVICE_ACCOUNT_PATH
         if service_account_path and Path(service_account_path).exists():
             try:
-                with open(service_account_path) as f:
+                with open(service_account_path, encoding="utf-8") as f:
                     result = json.load(f)
-                    from logger import activity_logger
-                    activity_logger.logger.info(f"✓ Loaded service account from {service_account_path}")
-                    return result
+                from logger import activity_logger
+                activity_logger.logger.info(f"✓ Loaded service account from {service_account_path}")
+                return result
             except (json.JSONDecodeError, IOError) as e:
                 raise ValueError(
-                    f"Failed to load service account from "
-                    f"{service_account_path}: {e}"
+                    f"Failed to load service account from {service_account_path}: {e}"
                 )
 
-        # Not found - provide helpful error message
+        # Not found
         from logger import activity_logger
         activity_logger.logger.warning(
             "Google service account credentials not found. "
-            "Set GOOGLE_SERVICE_ACCOUNT_JSON env var or place JSON file at: "
-            "./nth-station-489109-s1-6c5ccb8ccef4.json or "
-            "./SP-StockBot/nth-station-489109-s1-6c5ccb8ccef4.json"
+            "Set GOOGLE_SERVICE_ACCOUNT_JSON env var or place JSON file at one of the auto-detected locations."
         )
         raise ValueError(
             "Google service account credentials not found. "
-            "Set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_PATH"
+            "Set GOOGLE_SERVICE_ACCOUNT_JSON or ensure the JSON file exists."
         )
 
     @classmethod
@@ -190,3 +178,4 @@ if __name__ == "__main__":
         print(f"Debug: {Config.APP_DEBUG}")
         print(f"Database: {Config.DATABASE_PATH}")
         print(f"Workers: {Config.APP_WORKERS}")
+        print(f"Service Account Path: {Config.GOOGLE_SERVICE_ACCOUNT_PATH or '(not found)'}")

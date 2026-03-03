@@ -129,9 +129,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Line Bot SDK v3
-api_client = ApiClient(access_token=Config.LINE_CHANNEL_ACCESS_TOKEN)
+# ==================== LINE BOT SDK v3 – Correct Initialization ====================
+from linebot.v3.messaging import Configuration, ApiClient, MessagingApi  # ensure Configuration is imported
+
+configuration = Configuration(
+    access_token=Config.LINE_CHANNEL_ACCESS_TOKEN
+)
+api_client = ApiClient(configuration)
 messaging_api = MessagingApi(api_client)
+
 webhook_handler = WebhookHandler(Config.LINE_CHANNEL_SECRET)
 
 # Initialize components (lazy loaded)
@@ -234,8 +240,9 @@ def daily_anomaly_check():
                     text=f"📋 Daily Anomaly Report:\n\n{summary}"
                 )
                 messaging_api.push_message(
-                    Config.LINE_SUPER_ADMIN_ID, {"messages": [message.as_json_dict()]}
-                )
+                    to=Config.LINE_SUPER_ADMIN_ID,
+                    messages=[message]
+                )                
                 activity_logger.logger.info(
                     f"✓ Sent anomaly report to admin: {len(unnotified)} anomalies"
                 )
@@ -336,7 +343,10 @@ def check_drive_for_new_files():
             reply += f"Errors: {len(result['errors'])}\n"
 
         message = TextMessage(text=reply)
-        messaging_api.push_message(Config.LINE_SUPER_ADMIN_ID, {"messages": [message.as_json_dict()]})
+        messaging_api.push_message(
+            to=Config.LINE_SUPER_ADMIN_ID,
+            messages=[message]
+        )
 
         activity_logger.logger.info(f"✓ Processed {file_name}")
 
@@ -488,7 +498,7 @@ def validate_startup() -> bool:
         assert Config.LINE_CHANNEL_SECRET, "LINE_CHANNEL_SECRET not set"
         assert Config.LINE_CHANNEL_ACCESS_TOKEN, "LINE_CHANNEL_ACCESS_TOKEN not set"
         # Verify API client initialization
-        _ = MessagingApi(ApiClient(access_token=Config.LINE_CHANNEL_ACCESS_TOKEN))
+        _ = messaging_api  # simple reference to confirm it's usable
         print("  OK Line Bot SDK v3 handler configured")
         checks_passed += 1
     except AssertionError as e:
@@ -577,44 +587,37 @@ async def line_webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail="Internal error")
 
 
+# v3 decorator: TextMessage filter ensures ONLY text messages reach this handler
 @webhook_handler.add(MessageEvent, message=TextMessage)
 def handle_message(event: MessageEvent):
-    """Handle text message from Line."""
+    """Handle text messages from Line."""
     try:
-        # Type check for text messages
-        if not isinstance(event.message, TextMessage):
-            return
-        
         user_id = event.source.user_id
         user_message = event.message.text.strip()
 
-        # Log incoming message
         activity_logger.log_message_received(
             user_id=user_id,
             raw_message=user_message,
         )
 
-        # Initialize components
         db_instance = get_db()
         agent = get_groq_agent()
         admin_cmd = get_admin_commands()
         emp_cmd = get_employee_commands()
 
-        # Check if user exists and get role
         user = db_instance.get_user(user_id)
         is_admin = user is not None and user.get("role") == "super_admin"
         is_registered = user is not None
 
-        # If not registered, offer to register
         if not is_registered:
             reply_text = (
-                "👋 Welcome to SP-StockBot!\n\n"
-                "Please ask the admin to add you to the system.\n"
-                "Admin: Use 'Add user [name] PIN:[code]' to register employees."
+                "👋 ยินดีต้อนรับสู่ SP-StockBot!\n\n"
+                "กรุณาขอให้แอดมินเพิ่มคุณในระบบก่อนนะครับ\n"
+                "แอดมินใช้คำสั่ง: Add user [ชื่อ] PIN:[รหัส]"
             )
             messaging_api.reply_message(
-                event.reply_token,
-                {"messages": [{"type": "text", "text": reply_text}]},
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=reply_text)]
             )
             return
 
@@ -640,8 +643,8 @@ def handle_message(event: MessageEvent):
                     "Usage: [command] PIN:xxxx"
                 )
                 messaging_api.reply_message(
-                    event.reply_token,
-                    {"messages": [{"type": "text", "text": reply_text}]},
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
                 )
                 return
 
@@ -650,8 +653,8 @@ def handle_message(event: MessageEvent):
             ):
                 reply_text = "❌ PIN incorrect. Command rejected."
                 messaging_api.reply_message(
-                    event.reply_token,
-                    {"messages": [{"type": "text", "text": reply_text}]},
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
                 )
                 activity_logger.log_admin_action(
                     admin_line_id=user_id,
@@ -730,13 +733,12 @@ def handle_message(event: MessageEvent):
                 "Or ask: สตอก [item] / ใช้ [item] [qty]"
             )
 
-        # Send reply
+    # Final reply – always use this pattern
         messaging_api.reply_message(
-            event.reply_token,
-            {"messages": [{"type": "text", "text": reply_text}]},
+            reply_token=event.reply_token,
+            messages=[TextMessage(text=reply_text or "ได้รับข้อความแล้วครับ")]
         )
 
-        # Log action
         activity_logger.log_message_processed(
             user_id=user_id,
             intent=intent,
@@ -745,33 +747,32 @@ def handle_message(event: MessageEvent):
 
     except Exception as e:
         activity_logger.log_error(
-            f"Error handling message: {e}",
-            error_type="message_handler_error",
+            f"Error handling text message: {e}",
+            error_type="text_handler_error",
         )
-
         try:
             messaging_api.reply_message(
-                event.reply_token,
-                {"messages": [{"type": "text", "text": "⚠️ Error processing message. Please try again."}]},
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="⚠️ มีข้อผิดพลาดในการประมวลผล กรุณาลองใหม่นะครับ")]
             )
         except:
             pass
 
 
+# v3 decorator: NO message= filter means this catches ALL non-text MessageEvents (images, stickers, locations, etc.)
 @webhook_handler.add(MessageEvent)
 def handle_other_message(event: MessageEvent):
-    """Handle non-text messages."""
+    """Handle non-text messages (images, stickers, locations, etc.)."""
     try:
         messaging_api.reply_message(
-            event.reply_token,
-            {"messages": [{"type": "text", "text": "📝 Please send text messages only."}]},
+            reply_token=event.reply_token,
+            messages=[TextMessage(text="📎 กรุณาส่งข้อความตัวหนังสือเท่านั้นนะครับ")]
         )
     except Exception as e:
         activity_logger.log_error(
-            f"Error handling non-text message: {e}",
+            f"Error in non-text handler: {e}",
             error_type="non_text_handler_error",
         )
-
 
 # Admin API endpoints (optional, for debugging)
 @app.get("/api/anomalies", tags=["Admin"])

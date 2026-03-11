@@ -2,22 +2,32 @@
 SP-StockBot Main Application
 FastAPI webhook for Line Bot + Background task scheduler.
 Optimized for 8GB RAM, CPU-only (no local GPU).
+Includes vector DB (chromadb), embeddings, and Grafana integration.
 """
 
 import gc
 import logging
 import sys
-from datetime import datetime
+import os
+import re
+import json
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from contextlib import asynccontextmanager
+import tempfile
+import torch
 
 import psutil
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 
+# Vector DB and embeddings
+from chromadb import PersistentClient
+from sentence_transformers import SentenceTransformer
+
 # Line Bot SDK v3
-from linebot.v3.messaging import MessagingApi, ApiClient, TextMessage, ReplyMessageRequest
+from linebot.v3.messaging import MessagingApi, ApiClient, TextMessage, ReplyMessageRequest, FlexSendMessage
 from linebot.v3.webhook import WebhookHandler, MessageEvent
 from linebot.v3.webhooks import TextMessageContent
 from linebot.v3.exceptions import InvalidSignatureError
@@ -37,10 +47,396 @@ from commands.employee_commands import EmployeeCommands
 # Background scheduler (initialized before app for use in lifespan)
 scheduler = BackgroundScheduler()
 
+# ==================== VECTOR DB & EMBEDDINGS INITIALIZATION ====================
+# Initialize vector DB
+vector_db_path = os.getenv('VECTOR_DB_PATH', './vector_db')
+vector_client = PersistentClient(path=vector_db_path)
+
+# Get or create collections
+inventory_collection = vector_client.get_or_create_collection("inventory")
+user_collection = vector_client.get_or_create_collection("users")
+behavior_collection = vector_client.get_or_create_collection("behaviors")
+
+# Initialize embedding model with GPU detection
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model_name = os.getenv('EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
+embedding_model = SentenceTransformer(model_name).to(device)
+
+activity_logger.logger.info(f"Vector DB initialized at {vector_db_path}")
+activity_logger.logger.info(f"Embeddings model: {model_name} on device: {device}")
+
+# ==================== HELPER FUNCTIONS FOR VECTOR OPERATIONS ====================
+
+def parse_quantity(text: str) -> int:
+    """
+    Extract and sum numbers from the quantity part of a message.
+    Handles common mechanic reporting patterns:
+    - "เบิก กดทห80 5+5+"
+    - "กดทห100 10+"
+    - "ใช้ สเปย์ 3 ชิ้น"
+    - "5+10+2" (standalone)
+    - "เบิก นวม1000 5+3+2"
+    Focuses on the last number group(s) to avoid summing material codes like 80, 100.
+    
+    Args:
+        text: String containing quantity info (e.g., "เบิก กดทห80 5+5+", "5+10+2")
+        
+    Returns:
+        Sum of extracted numbers from quantity part, or 0 if parsing fails
+    """
+    if not text or not str(text).strip():
+        return 0
+
+    text = str(text).strip()
+    
+    try:
+        # Step 1: Look for pattern with + signs (highest confidence - actual quantities)
+        # Matches: "5+5+" or "10+2+" or "5+3+2" or "10+2"
+        # This regex finds: digit(s) followed by (+digit)+ and optional trailing +
+        match_plus = re.search(r'(\d+(?:\s*\+\s*\d+)+\+?)$', text)
+        if match_plus:
+            qty_part = match_plus.group(1)
+            numbers = re.findall(r'\d+', qty_part)
+            if numbers:
+                return sum(int(x) for x in numbers)
+        
+        # Step 2: If no + pattern found, look for the last standalone number in text
+        # (which might not be the last token if followed by unit words like "pieces" or "ชิ้น")
+        # Scan from right to left for numbers, skipping Thai material codes
+        tokens = text.split()
+        
+        # Iterate through tokens in reverse order
+        for i in range(len(tokens) - 1, -1, -1):
+            token = tokens[i]
+            # Does this token contain digits?
+            if re.search(r'\d', token):
+                numbers = re.findall(r'\d+', token)
+                if numbers:
+                    # Check if this token is preceded by Thai text (material code indicator)
+                    if i > 0:
+                        prev_token = tokens[i - 1]
+                        has_thai_prefix = any(ord(c) > 127 for c in prev_token)
+                        max_num = max(int(x) for x in numbers)
+                        if has_thai_prefix and max_num >= 50:
+                            # Skip this - likely a material code like "กดทห80"
+                            continue
+                    
+                    # Accept this number
+                    return sum(int(x) for x in numbers)
+        
+        return 0
+    
+    except Exception as e:
+        activity_logger.logger.warning(f"Error parsing quantity '{text}': {e}")
+        return 0
+
+
+def embed_and_upsert(text: str, doc_id: str, collection_ref, metadata: Dict[str, Any]):
+    """Embed text and upsert to vector collection."""
+    try:
+        if not text or not text.strip():
+            return
+        embedding = embedding_model.encode(text)
+        collection_ref.upsert(
+            ids=[doc_id],
+            embeddings=[embedding.tolist()],
+            documents=[text],
+            metadatas=[metadata]
+        )
+    except Exception as e:
+        activity_logger.logger.error(f"Error embedding and upserting {doc_id}: {e}")
+
+
+def split_into_chunks(text: str, max_tokens: int = 512) -> list:
+    """Split text into chunks by word count (~4 chars per token)."""
+    if not text:
+        return []
+    
+    max_length = max_tokens * 4
+    words = text.split()
+    chunks = []
+    current = []
+    
+    for word in words:
+        current.append(word)
+        if len(' '.join(current)) >= max_length:
+            chunks.append(' '.join(current))
+            current = []
+    
+    if current:
+        chunks.append(' '.join(current))
+    
+    return chunks if chunks else [text]
+
+
+def register_user_with_vector_profile(user_id: str, display_name: str) -> bool:
+    """
+    Register a new user with vector profile.
+    Creates per-user Drive folder and embeds profile in vector DB.
+    
+    Args:
+        user_id: Line user ID
+        display_name: User's display name
+        
+    Returns:
+        True if registration successful, False otherwise
+    """
+    try:
+        activity_logger.logger.info(f"Registering user: {user_id} ({display_name})")
+        
+        # Create per-user Drive folder
+        try:
+            drive = get_drive_handler()
+            if drive and Config.GOOGLE_DRIVE_FOLDER_ID:
+                folder_result = drive.service.files().create(
+                    body={
+                        'name': f'Users/{user_id}',
+                        'mimeType': 'application/vnd.google-apps.folder',
+                        'parents': [Config.GOOGLE_DRIVE_FOLDER_ID]
+                    },
+                    fields='id'
+                ).execute()
+                
+                user_folder_id = folder_result.get('id')
+                activity_logger.logger.info(f"Created Drive folder for {user_id}: {user_folder_id}")
+        except Exception as e:
+            activity_logger.logger.warning(f"Could not create Drive folder for {user_id}: {e}")
+        
+        # Embed user profile in vector DB
+        profile_text = f"User: {display_name} (ID: {user_id}), registered {datetime.now(tz=timezone('Asia/Bangkok')).isoformat()}"
+        embed_and_upsert(
+            text=profile_text,
+            doc_id=f"user_profile_{user_id}",
+            collection_ref=user_collection,
+            metadata={
+                'user_id': user_id,
+                'type': 'profile',
+                'display_name': display_name,
+                'registered_at': datetime.now(tz=timezone('Asia/Bangkok')).isoformat()
+            }
+        )
+        
+        # Log registration in behavior collection
+        from utils import format_notification_message
+        notification = format_notification_message('registration', display_name, {})
+        embed_and_upsert(
+            text=notification,
+            doc_id=f"behavior_registration_{user_id}_{datetime.now().timestamp()}",
+            collection_ref=behavior_collection,
+            metadata={
+                'user_id': user_id,
+                'type': 'registration',
+                'timestamp': datetime.now(tz=timezone('Asia/Bangkok')).isoformat()
+            }
+        )
+        
+        activity_logger.logger.info(f"✓ User {user_id} registered successfully with vector profile")
+        return True
+    
+    except Exception as e:
+        activity_logger.logger.error(f"Error registering user {user_id}: {e}")
+        return False
+
+
+def handle_inventory_report(user_id: str, display_name: str, material: str, quantity_str: str) -> int:
+    """
+    Handle inventory report: parse quantity, embed narrative in vector DB.
+    
+    Args:
+        user_id: Line user ID
+        display_name: User's display name
+        material: Material/item name
+        quantity_str: Quantity string (e.g., "5+5+")
+        
+    Returns:
+        Parsed quantity as integer
+    """
+    try:
+        qty = parse_quantity(quantity_str)
+        
+        # Create narrative for embedding
+        narrative = f"{display_name} reported {qty} of {material} at {datetime.now(tz=timezone('Asia/Bangkok')).isoformat()}"
+        
+        # Embed in inventory collection
+        doc_id = f"report_{user_id}_{material}_{datetime.now().timestamp()}"
+        embed_and_upsert(
+            text=narrative,
+            doc_id=doc_id,
+            collection_ref=inventory_collection,
+            metadata={
+                'user_id': user_id,
+                'type': 'report',
+                'material': material,
+                'quantity': qty,
+                'reported_at': datetime.now(tz=timezone('Asia/Bangkok')).isoformat()
+            }
+        )
+        
+        # Log in behavior collection
+        from utils import format_notification_message
+        notification = format_notification_message('report', display_name, {'material': material, 'qty': qty})
+        embed_and_upsert(
+            text=notification,
+            doc_id=f"behavior_report_{user_id}_{datetime.now().timestamp()}",
+            collection_ref=behavior_collection,
+            metadata={
+                'user_id': user_id,
+                'type': 'report',
+                'material': material,
+                'quantity': qty,
+                'timestamp': datetime.now(tz=timezone('Asia/Bangkok')).isoformat()
+            }
+        )
+        
+        activity_logger.logger.info(f"✓ Report embedded: {display_name} reported {qty} of {material}")
+        return qty
+    
+    except Exception as e:
+        activity_logger.logger.error(f"Error handling inventory report: {e}")
+        return 0
+
+
+def query_user_inventory_reports(user_id: str, limit: int = 5) -> list:
+    """
+    Query vector DB for user's recent inventory reports.
+    
+    Args:
+        user_id: Line user ID
+        limit: Maximum number of results
+        
+    Returns:
+        List of dicts with 'material', 'qty', 'timestamp'
+    """
+    try:
+        results = inventory_collection.query(
+            query_texts=["inventory report"],
+            n_results=limit,
+            where={"user_id": user_id, "type": "report"}
+        )
+        
+        materials = []
+        if results['metadatas']:
+            for metadata in results['metadatas'][0]:
+                materials.append({
+                    'material': metadata.get('material', 'Unknown'),
+                    'qty': metadata.get('quantity', 0),
+                    'timestamp': metadata.get('reported_at', '')
+                })
+        
+        return materials
+    
+    except Exception as e:
+        activity_logger.logger.error(f"Error querying user reports: {e}")
+        return []
+
+
+def send_report_flex_message(user_id: str, display_name: str):
+    """
+    Send personalized inventory report Flex message to user.
+    Queries vector DB for user's recent reports.
+    
+    Args:
+        user_id: Line user ID
+        display_name: User's display name
+    """
+    try:
+        from utils import get_report_flex
+        
+        # Query user's recent reports
+        materials = query_user_inventory_reports(user_id, limit=5)
+        
+        if not materials:
+            # No reports found, send notification
+            msg = TextMessage(text="📊 No recent inventory reports found. Start reporting!")
+            messaging_api.push_message(to=user_id, messages=[msg])
+            return
+        
+        # Generate Flex message
+        flex_content = get_report_flex(display_name, materials)
+        flex_message = FlexSendMessage(
+            alt_text="Inventory Report",
+            contents=flex_content
+        )
+        
+        messaging_api.push_message(to=user_id, messages=[flex_message])
+        activity_logger.logger.info(f"✓ Sent report Flex to {user_id}")
+    
+    except Exception as e:
+        activity_logger.logger.error(f"Error sending report Flex: {e}")
+
+
+def send_alert_flex_message(user_id: str, alert_title: str, alert_message: str, severity: str = "warning"):
+    """
+    Send anomaly/system alert Flex message.
+    
+    Args:
+        user_id: Line user ID to receive alert
+        alert_title: Alert title
+        alert_message: Alert message text
+        severity: 'warning', 'error', or 'info'
+    """
+    try:
+        from utils import get_alert_flex
+        
+        flex_content = get_alert_flex(alert_title, alert_message, severity)
+        flex_message = FlexSendMessage(
+            alt_text=alert_title,
+            contents=flex_content
+        )
+        
+        messaging_api.push_message(to=user_id, messages=[flex_message])
+        activity_logger.logger.info(f"✓ Sent {severity} alert Flex to {user_id}")
+    
+    except Exception as e:
+        activity_logger.logger.error(f"Error sending alert Flex: {e}")
+
+
+def send_stock_check_flex_message(user_id: str, display_name: str, materials: list):
+    """
+    Send stock level check Flex message.
+    
+    Args:
+        user_id: Line user ID
+        display_name: User's name
+        materials: List of dicts with material info
+    """
+    try:
+        from utils import get_stock_check_flex
+        
+        flex_content = get_stock_check_flex(materials, display_name)
+        flex_message = FlexSendMessage(
+            alt_text="Stock Check",
+            contents=flex_content
+        )
+        
+        messaging_api.push_message(to=user_id, messages=[flex_message])
+        activity_logger.logger.info(f"✓ Sent stock check Flex to {user_id}")
+    
+    except Exception as e:
+        activity_logger.logger.error(f"Error sending stock check Flex: {e}")
+
 
 # Lifespan context manager for FastAPI startup/shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Auto-register super admin if not exists
+    db = get_db()
+    super_admin_id = Config.LINE_SUPER_ADMIN_ID
+    if not db.get_user(super_admin_id):
+        db.add_user(
+            line_user_id=super_admin_id,
+            display_name="Super Admin (Auto)",
+            excel_name="Super Admin (Auto)",
+            role="super_admin"
+        )
+        activity_logger.logger.info(f"Auto-registered super admin: {super_admin_id}")
+    
+    # Load saved Google Drive folder ID from database
+    saved_folder_id = db.get_setting("GOOGLE_DRIVE_FOLDER_ID")
+    if saved_folder_id:
+        Config.GOOGLE_DRIVE_FOLDER_ID = saved_folder_id
+        activity_logger.logger.info(f"Loaded GOOGLE_DRIVE_FOLDER_ID from DB: {saved_folder_id}")
+    
     """Handle startup and shutdown events with asynccontextmanager."""
     # ==================== STARTUP ====================
     try:
@@ -276,37 +672,248 @@ def memory_cleanup():
         activity_logger.logger.warning(f"Memory cleanup error: {e}")
 
 
-def check_drive_for_new_files():
-    """Check Drive for new inventory files and parse them."""
+def extract_and_embed_file(file_id: str, file_name: str, mime_type: str, user_id: str, drive_handler):
+    """
+    Dynamically extract and embed file content in vector DB.
+    Supports: .xlsx, .pdf, .docx, .png, .jpeg
+    
+    Args:
+        file_id: Google Drive file ID
+        file_name: File name
+        mime_type: MIME type
+        user_id: User ID for metadata
+        drive_handler: DriveHandler instance
+        
+    Returns:
+        True if successful, False otherwise
+    """
     try:
-        activity_logger.logger.info("▶ Checking Drive for new files...")
+        from utils import extract_file_content, split_into_chunks, detect_file_type
+        
+        file_type = detect_file_type(mime_type)
+        
+        if file_type == 'unknown':
+            activity_logger.logger.warning(f"Unsupported file type: {mime_type}")
+            return False
+        
+        # Download file
+        tmp_file = tempfile.NamedTemporaryFile(delete=False)
+        tmp_path = tmp_file.name
+        tmp_file.close()
+        
+        success = drive_handler.download_file(file_id, tmp_path)
+        if not success:
+            activity_logger.logger.error(f"Failed to download {file_name}")
+            return False
+        
+        # Extract text from file
+        activity_logger.logger.info(f"Extracting content from {file_name} ({file_type})...")
+        text_content = extract_file_content(tmp_path, file_type)
+        
+        if not text_content:
+            activity_logger.logger.warning(f"No content extracted from {file_name}")
+            return False
+        
+        # Split into chunks and embed
+        chunks = split_into_chunks(text_content, max_tokens=512)
+        activity_logger.logger.info(f"Split into {len(chunks)} chunks for embedding")
+        
+        for i, chunk in enumerate(chunks):
+            try:
+                doc_id = f"{user_id}_{file_id}_{i}"
+                embed_and_upsert(
+                    text=chunk,
+                    doc_id=doc_id,
+                    collection_ref=inventory_collection,
+                    metadata={
+                        'user_id': user_id,
+                        'file_type': file_type,
+                        'file_name': file_name,
+                        'file_id': file_id,
+                        'extracted_at': datetime.now(tz=timezone('Asia/Bangkok')).isoformat(),
+                        'chunk_index': i
+                    }
+                )
+            except Exception as e:
+                activity_logger.logger.error(f"Error embedding chunk {i}: {e}")
+        
+        activity_logger.logger.info(f"✓ Embedded {len(chunks)} chunks from {file_name}")
+        
+        # Clean up
+        try:
+            os.remove(tmp_path)
+        except:
+            pass
+        
+        return True
+    
+    except Exception as e:
+        activity_logger.logger.error(f"Error extracting file {file_name}: {e}")
+        return False
+
+
+def check_drive_for_new_files():
+    """
+    Check Drive for new inventory files in per-user folders.
+    Supports dynamic extraction: .xlsx, .pdf, .docx, .png, .jpeg
+    Deletes files after successful extraction.
+    """
+    try:
+        activity_logger.logger.info(
+            f"▶ [Drive Scan] Starting background file scan (with vector extraction) | "
+            f"Folder ID: {Config.GOOGLE_DRIVE_FOLDER_ID}"
+        )
 
         if not Config.GOOGLE_DRIVE_FOLDER_ID:
             activity_logger.logger.warning(
-                "GOOGLE_DRIVE_FOLDER_ID not configured"
+                "[Drive Scan] GOOGLE_DRIVE_FOLDER_ID not configured - skipping"
             )
             return
 
         drive = get_drive_handler()
         if not drive:
+            activity_logger.logger.error(
+                "[Drive Scan] Drive handler is None - service unavailable"
+            )
+            return
+
+        # Query per-user folders (Users/*)
+        try:
+            user_folders_results = drive.service.files().list(
+                q=f"'{Config.GOOGLE_DRIVE_FOLDER_ID}' in parents and name contains 'Users/' and mimeType='application/vnd.google-apps.folder'",
+                spaces='drive',
+                fields='files(id, name)',
+                pageSize=50
+            ).execute()
+            
+            user_folders = user_folders_results.get('files', [])
+            activity_logger.logger.info(f"[Drive Scan] Found {len(user_folders)} user folders")
+        except Exception as e:
+            activity_logger.logger.warning(f"Error querying user folders: {e}")
+            user_folders = []
+        
+        # Process each user folder
+        for user_folder in user_folders:
+            try:
+                user_id = user_folder['name'].split('/')[-1]
+                folder_id = user_folder['id']
+                
+                activity_logger.logger.debug(f"[Drive Scan] Processing user folder: {user_id}")
+                
+                # List files in user folder
+                files_results = drive.service.files().list(
+                    q=f"'{folder_id}' in parents and trashed=false",
+                    spaces='drive',
+                    fields='files(id, name, mimeType)',
+                    pageSize=10
+                ).execute()
+                
+                files = files_results.get('files', [])
+                
+                for file in files:
+                    try:
+                        file_id = file.get('id')
+                        file_name = file.get('name')
+                        mime_type = file.get('mimeType', '')
+                        
+                        # Check if already processed
+                        db_instance = get_db()
+                        processed = db_instance.get_processed_file(file_id)
+                        if processed:
+                            activity_logger.logger.debug(f"File already processed: {file_name}")
+                            continue
+                        
+                        # Extract and embed
+                        success = extract_and_embed_file(file_id, file_name, mime_type, user_id, drive)
+                        
+                        if success:
+                            # Mark as processed
+                            db_instance.mark_file_processed(
+                                file_id=file_id,
+                                file_name=file_name,
+                                records_count=1
+                            )
+                            
+                            # Delete file from Drive
+                            try:
+                                drive.service.files().delete(fileId=file_id).execute()
+                                activity_logger.logger.info(f"✓ Deleted file after extraction: {file_name}")
+                            except Exception as e:
+                                activity_logger.logger.warning(f"Could not delete file {file_name}: {e}")
+                            
+                            # Notify user
+                            user_display_name = db_instance.get_user(user_id)
+                            if user_display_name:
+                                display_name = user_display_name.get('display_name', user_id)
+                                send_alert_flex_message(
+                                    user_id,
+                                    "File Processed",
+                                    f"✓ Successfully extracted and embedded: {file_name}",
+                                    "info"
+                                )
+                    
+                    except Exception as e:
+                        activity_logger.logger.error(f"Error processing file {file_name}: {e}")
+            
+            except Exception as e:
+                activity_logger.logger.error(f"Error processing user folder: {e}")
+        
+        activity_logger.logger.info("✓ Drive scan completed")
+
+    except Exception as e:
+        activity_logger.log_error(
+            f"Error checking Drive files: {e}",
+            error_type="drive_check_error",
+        )
+
+
+def check_drive_for_new_files_legacy():
+    """Legacy function for XLSX-only extraction. Kept for backward compatibility."""
+    try:
+        activity_logger.logger.info(
+            f"▶ [Drive Scan Legacy] Starting XLSX-only scan | "
+            f"Folder ID: {Config.GOOGLE_DRIVE_FOLDER_ID}"
+        )
+
+        if not Config.GOOGLE_DRIVE_FOLDER_ID:
+            activity_logger.logger.warning(
+                "[Drive Scan] GOOGLE_DRIVE_FOLDER_ID not configured - skipping"
+            )
+            return
+
+        drive = get_drive_handler()
+        if not drive:
+            activity_logger.logger.error(
+                "[Drive Scan] Drive handler is None - service unavailable"
+            )
             return
 
         # Find latest XLSX file
+        activity_logger.logger.debug(
+            f"[Drive Scan] Querying folder: {Config.GOOGLE_DRIVE_FOLDER_ID}"
+        )
+        
         latest_file = drive.find_latest_xlsx(Config.GOOGLE_DRIVE_FOLDER_ID)
 
         if not latest_file:
-            activity_logger.logger.info("No XLSX files found in Drive")
+            activity_logger.logger.info(
+                f"[Drive Scan] No XLSX files found in folder {Config.GOOGLE_DRIVE_FOLDER_ID}"
+            )
             return
 
         file_id = latest_file.get("id")
         file_name = latest_file.get("name")
+        
+        activity_logger.logger.info(
+            f"[Drive Scan] Found file: {file_name} | ID: {file_id}"
+        )
 
         # Check if we've already processed this file
         db_instance = get_db()
         processed = db_instance.get_processed_file(file_id)
         if processed:
             activity_logger.logger.info(
-                f"File {file_name} already processed"
+                f"[Drive Scan] File already processed: {file_name}"
             )
             return
 
@@ -567,10 +1174,15 @@ async def line_webhook(request: Request, background_tasks: BackgroundTasks):
 
     try:
         body = await request.body()
+        body_str = body.decode("utf-8")
+        
+        # Debug logging
+        activity_logger.logger.debug(f"[Webhook] Received body length: {len(body_str)} | Signature: {signature[:20]}")
+        activity_logger.logger.debug(f"[Webhook] Body: {body_str[:200]}")
 
         # Verify signature
         try:
-            webhook_handler.handle(body.decode("utf-8"), signature)
+            webhook_handler.handle(body_str, signature)
         except InvalidSignatureError:
             activity_logger.log_error(
                 "Invalid Line signature",
@@ -734,12 +1346,32 @@ def handle_message(event: MessageEvent):
             else:
                 reply_text = emp_cmd.get_help_text()
 
-        else:
-            reply_text = (
-                "❓ Unknown command.\n"
-                "Use: Help / ช่วย\n\n"
-                "Or ask: สตอก [item] / ใช้ [item] [qty]"
+        elif intent in ("error", "other"):
+            # Groq failed or couldn't classify intent
+            # Log it but don't reply (silent ignore)
+            activity_logger.logger.warning(
+                f"[Intent] Unclassified message | User: {user_id} | Intent: {intent} | "
+                f"Confidence: {intent_result.get('confidence', 0)}"
             )
+            # Don't send a reply - just acknowledge silently
+            activity_logger.log_message_processed(
+                user_id=user_id,
+                intent=intent,
+                action_result="ignored",
+            )
+            return  # Exit early without reply
+
+        else:
+            # Unknown intent type (shouldn't reach here, but be defensive)
+            activity_logger.logger.warning(
+                f"[Intent] Unknown intent type: {intent} for user {user_id}"
+            )
+            activity_logger.log_message_processed(
+                user_id=user_id,
+                intent=intent,
+                action_result="ignored",
+            )
+            return  # Exit early without reply
 
         # Final reply – ReplyMessageRequest wrapper pattern
         messaging_api.reply_message(

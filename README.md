@@ -114,12 +114,61 @@ LOG_LEVEL=INFO
 
 ### 6. (Optional) Google Drive Service Account
 
-For Drive integration:
-1. Google Cloud Console → Create project
-2. Enable Drive API
-3. Service Account → Create key (JSON)
-4. Download and save path in `.env`
-5. Share Drive folder with service account email
+**⚠️ IMPORTANT: Enable Google Drive API Before Using Drive Features**
+
+Drive integration requires the Google Drive API to be enabled in your Cloud project:
+
+#### Step 1: Create Google Cloud Project
+
+1. Visit: https://console.cloud.google.com/
+2. Create a new project (e.g., "SP-StockBot")
+3. Note the **Project ID** (you'll need it next)
+
+#### Step 2: Enable Google Drive API (CRITICAL)
+
+**For Project 739402046175** (used in production):
+- Direct link: https://console.developers.google.com/apis/api/drive.googleapis.com/overview?project=739402046175
+
+**For Your Own Project**:
+1. Go to: https://console.cloud.google.com/apis/library
+2. Search for "Google Drive API"
+3. Click the result
+4. Click **Enable**
+5. Wait 30-60 seconds for the API to activate
+
+**If you see `403 accessNotConfigured` errors**:
+- The Drive API is NOT enabled
+- Follow the steps above to enable it
+- Restart the bot service after enabling
+
+#### Step 3: Create Service Account & JSON Key
+
+1. Go to: https://console.cloud.google.com/iam-admin/serviceaccounts
+2. Click **Create Service Account**
+3. Enter name (e.g., "sp-stockbot")
+4. Grant roles: **Editor** (or just Drive scope if preferred)
+5. Click **Create and Continue**
+6. Go to the "Keys" tab
+7. Click **Add Key** → **Create New Key**
+8. Choose **JSON**
+9. Download the file (save as `nth-station-489109-s1-6c5ccb8ccef4.json`)
+
+#### Step 4: Share Drive Folder with Service Account
+
+1. Open the JSON file and find: `"client_email"`
+2. Copy the service account email
+3. Go to your Google Drive folder
+4. Right-click → **Share**
+5. Paste the service account email
+6. Select **Editor** access
+7. Click **Share**
+
+#### Step 5: Configure .env
+
+```env
+GOOGLE_SERVICE_ACCOUNT_JSON=/path/to/nth-station-489109-s1-6c5ccb8ccef4.json
+GOOGLE_DRIVE_FOLDER_ID=   # Set via "Set drive" command in chat, or manually here
+```
 
 ---
 

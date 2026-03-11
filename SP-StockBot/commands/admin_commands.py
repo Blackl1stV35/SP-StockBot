@@ -5,6 +5,7 @@ Requires PIN verification. Commands: add_user, bulk_add, set_drive, etc.
 
 from typing import Dict, List, Optional, Tuple
 import json
+import re
 
 from config import Config
 from database import Database
@@ -184,28 +185,58 @@ class AdminCommands:
 
     def set_drive_folder(
         self,
-        drive_folder_id: str,
+        drive_folder_input: str,
     ) -> Tuple[bool, str]:
         """
         Set primary Google Drive folder for uploads.
+        Accepts full URL or folder ID.
         Admin should share the folder with bot's service account first.
+        Saves to both DB and Config for persistence.
         """
         try:
-            # In production, validate folder ID and permissions
-            # For now, just store it
+            if not drive_folder_input:
+                return False, "❌ Drive folder URL or ID required"
 
-            # Update config (would need to save to .env)
+            # Parse folder ID from URL or bare ID
+            folder_id = self._extract_drive_id_from_url(drive_folder_input.strip())
+            
+            if not folder_id:
+                return False, "❌ Invalid Drive folder URL or ID format"
+
+            # Validate folder ID format (Google Drive IDs are typically 33 chars, alphanumeric + - and _)
+            if not re.match(r'^[a-zA-Z0-9\-_]{20,}$', folder_id):
+                return False, f"❌ Invalid folder ID format: {folder_id}"
+
+            # Save to database (persistent)
+            success_db = self.db.set_setting(
+                key="GOOGLE_DRIVE_FOLDER_ID",
+                value=folder_id,
+                description="Primary Google Drive folder for inventory file uploads",
+                updated_by=Config.LINE_SUPER_ADMIN_ID,
+            )
+
+            if not success_db:
+                return False, "❌ Failed to save folder ID to database"
+
+            # Update Config in-memory
+            Config.GOOGLE_DRIVE_FOLDER_ID = folder_id
+
+            # Log the action
             activity_logger.log_admin_action(
                 admin_line_id=Config.LINE_SUPER_ADMIN_ID,
                 action="set_drive_folder",
-                parameters={"folder_id": drive_folder_id},
+                parameters={"folder_id": folder_id},
                 pin_verified=True,
+                success=True,
             )
 
             return (
                 True,
-                f"✓ Drive folder configured: {drive_folder_id}\n"
-                f"Remember to share this folder with the bot's service account",
+                f"✓ Drive folder SAVED:\n"
+                f"Folder ID: {folder_id}\n\n"
+                f"✅ Persistent storage: Database\n"
+                f"✅ Memory: Config.GOOGLE_DRIVE_FOLDER_ID\n\n"
+                f"Bot will now scan this folder every 15 minutes."
             )
 
         except Exception as e:
@@ -213,7 +244,7 @@ class AdminCommands:
                 f"Error setting drive folder: {e}",
                 error_type="set_drive_error",
             )
-            return False, f"Error: {str(e)}"
+            return False, f"❌ Error: {str(e)}"
 
     def get_system_stats(self) -> str:
         """Get system statistics."""
@@ -290,13 +321,40 @@ class AdminCommands:
 
         return None, params
 
-    def _extract_drive_id_from_url(self, url: str) -> str:
-        """Extract Drive folder ID from sharing link."""
-        if "/folders/" in url:
-            return url.split("/folders/")[1].split("?")[0]
-        elif "/drive/folders/" in url:
-            return url.split("/drive/folders/")[1].split("?")[0]
-        return url
+    def _extract_drive_id_from_url(self, url: str) -> Optional[str]:
+        """
+        Extract Drive folder ID from sharing link with regex.
+        Supports formats:
+        - https://drive.google.com/drive/folders/1GqzO3zkXXhgEV5q_M3ENQcZfOTVZDgL2?usp=sharing
+        - https://drive.google.com/drive/folders/1GqzO3zkXXhgEV5q_M3ENQcZfOTVZDgL2
+        - 1GqzO3zkXXhgEV5q_M3ENQcZfOTVZDgL2 (bare ID)
+        """
+        if not url:
+            return None
+        
+        # If it looks like a folder ID already (alphanumeric with - and _)
+        if re.match(r'^[a-zA-Z0-9\-_]{20,}$', url.strip()):
+            return url.strip()
+        
+        # Try regex patterns for different Google Drive URL formats
+        patterns = [
+            r'/folders/([a-zA-Z0-9\-_]+)',  # /folders/{ID}
+            r'/drive/folders/([a-zA-Z0-9\-_]+)',  # /drive/folders/{ID}
+            r'[?&]id=([a-zA-Z0-9\-_]+)',  # ?id={ID}
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                folder_id = match.group(1)
+                if len(folder_id) >= 20:  # Google Drive folder IDs are typically 33 chars
+                    return folder_id
+        
+        # Fallback: return the original if it seems to be an ID
+        if url.strip() and len(url.strip()) > 10:
+            return url.strip()
+        
+        return None
 
     def get_help_text(self, is_admin: bool = False) -> str:
         """Get help text for user."""

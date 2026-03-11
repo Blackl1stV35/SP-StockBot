@@ -1,6 +1,6 @@
 """
 Google Drive integration for SP-StockBot.
-Handles authentication, file uploads/downloads, and folder structure.
+Handles authentication, file listing, and folder operations.
 """
 
 import os
@@ -12,6 +12,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.errors import HttpError
 
 from config import Config
 from logger import activity_logger
@@ -36,91 +37,128 @@ class DriveHandler:
                 service_account_info, scopes=self.SCOPES
             )
 
-            self.service = build("drive", "v3", credentials=credentials)
+            self.service = build("drive", "v3", credentials=credentials, cache_discovery=False)
             activity_logger.logger.info("✓ Google Drive authenticated successfully")
 
+            # Test minimal access
+            self.service.files().get(fileId="root", fields="id").execute()
+            activity_logger.logger.debug("Drive API test call succeeded")
+
         except ValueError as e:
-            # Service account not found - Drive will be unavailable but startup continues
             activity_logger.logger.warning(
-                f"Google Drive credentials not configured: {e}. "
-                "Drive features will be unavailable, but app will continue."
-            )
-            self.service = None
-            
-        except Exception as e:
-            # Other auth errors - log but don't crash
-            activity_logger.log_error(
-                f"Failed to authenticate Google Drive: {e}",
-                error_type="drive_auth_error",
+                f"Google Drive credentials not configured: {e}. Drive features unavailable."
             )
             self.service = None
 
-    def create_folder_structure(self, parent_folder_id: str) -> Dict[str, str]:
+        except HttpError as e:
+            activity_logger.log_error(
+                f"Drive API authentication failed: {e}",
+                error_type="drive_auth_http_error"
+            )
+            self.service = None
+
+        except Exception as e:
+            activity_logger.log_error(
+                f"Unexpected error authenticating Drive: {e}",
+                error_type="drive_auth_error"
+            )
+            self.service = None
+
+    def get_folder_files(self, folder_id: str, mime_type: str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", limit: int = 10) -> List[Dict[str, Any]]:
+        """List XLSX files in a specific folder."""
+        if not self.service:
+            activity_logger.logger.warning("Drive service not available - authentication failed")
+            return []
+
+        if not folder_id:
+            activity_logger.logger.warning("No folder ID provided for file listing")
+            return []
+
+        try:
+            # Log the query details for debugging
+            mime_type_short = mime_type.split("/")[-1] if "+" not in mime_type else "xlsx"
+            activity_logger.logger.debug(
+                f"[Drive] Querying folder: {folder_id} | MIME: {mime_type_short} | Limit: {limit}"
+            )
+
+            query = f"'{folder_id}' in parents and trashed=false and mimeType='{mime_type}'"
+            
+            activity_logger.logger.debug(f"[Drive] Query: {query}")
+            
+            results = self.service.files().list(
+                q=query,
+                spaces="drive",
+                fields="files(id, name, mimeType, createdTime, size)",
+                pageSize=limit,
+                orderBy="createdTime desc"
+            ).execute()
+
+            files = results.get("files", [])
+            
+            activity_logger.logger.info(
+                f"[Drive] Found {len(files)} files in folder {folder_id} | "
+                f"Folder: {folder_id}"
+            )
+            
+            for file in files:
+                activity_logger.logger.debug(
+                    f"[Drive] File: {file.get('name')} | ID: {file.get('id')} | "
+                    f"Size: {file.get('size', 0)} bytes"
+                )
+            
+            return files
+
+        except HttpError as e:
+            error_code = e.resp.status if hasattr(e, 'resp') else 'unknown'
+            activity_logger.log_error(
+                f"Failed to list files in {folder_id}: HTTP {error_code} - {e}",
+                error_type=f"drive_list_error_{error_code}"
+            )
+            return []
+
+        except Exception as e:
+            activity_logger.log_error(
+                f"Unexpected error listing files in {folder_id}: {e}",
+                error_type="drive_list_unexpected"
+            )
+            return []
+
+    def create_folder_structure(self, parent_folder_id: str = None) -> Dict[str, str]:
         """
-        Create folder structure:
-        OurFirmInventory/
-          ├── Stock_2569/
-          ├── Stock_2570/
-          └── Archives/
+        Create standard folder structure if needed.
         Returns mapping of folder names to IDs.
         """
         if not self.service:
-            activity_logger.logger.warning(
-                "Google Drive not authenticated. Folder structure not created."
-            )
             return {}
-        
-        try:
-            folders = {}
 
-            # Create main folder
-            main_folder = self._create_folder(
-                "OurFirmInventory", parent_folder_id
-            )
-            folders["OurFirmInventory"] = main_folder
+        folders = {
+            "OurFirmInventory": parent_folder_id,
+            "Stock_2569": None,
+            "Archives": None,
+        }
 
-            # Create year folders (Thai year)
-            year_folders = ["Stock_2569", "Stock_2570", "Stock_2571"]
-            for year_folder in year_folders:
-                year_id = self._create_folder(year_folder, main_folder)
-                folders[year_folder] = year_id
+        for name, parent in folders.items():
+            if parent is None:
+                parent = "root" if name == "OurFirmInventory" else folders["OurFirmInventory"]
 
-            # Create archives folder
-            archives_id = self._create_folder("Archives", main_folder)
-            folders["Archives"] = archives_id
+            query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and '{parent}' in parents and trashed=false"
+            response = self.service.files().list(q=query, fields="files(id, name)").execute()
+            existing = response.get("files", [])
 
-            activity_logger.logger.info(
-                f"✓ Created Drive folder structure: {folders}"
-            )
-            return folders
+            if existing:
+                folders[name] = existing[0]["id"]
+                activity_logger.logger.info(f"Found existing folder {name} (ID: {folders[name]})")
+            else:
+                file_metadata = {
+                    "name": name,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [parent] if parent != "root" else []
+                }
+                folder = self.service.files().create(body=file_metadata, fields="id").execute()
+                folders[name] = folder.get("id")
+                activity_logger.logger.info(f"Created folder {name} (ID: {folders[name]})")
 
-        except Exception as e:
-            activity_logger.log_error(
-                f"Failed to create folder structure: {e}",
-                error_type="drive_folder_error",
-            )
-            raise
-
-    def _create_folder(self, folder_name: str, parent_id: str) -> str:
-        """Create a single folder and return its ID."""
-        try:
-            file_metadata = {
-                "name": folder_name,
-                "mimeType": "application/vnd.google-apps.folder",
-                "parents": [parent_id],
-            }
-            folder = self.service.files().create(
-                body=file_metadata, fields="id"
-            ).execute()
-
-            return folder.get("id")
-
-        except Exception as e:
-            activity_logger.log_error(
-                f"Failed to create folder '{folder_name}': {e}",
-                error_type="drive_create_folder_error",
-            )
-            raise
+        return folders
 
     def upload_file(
         self,
@@ -380,21 +418,18 @@ def get_drive_handler() -> DriveHandler:
 
 
 if __name__ == "__main__":
-    # Test Drive integration
+    # Quick test
     try:
-        handler = DriveHandler()
-        print("✓ Google Drive authentication successful")
+        handler = get_drive_handler()
+        print("Drive handler initialized")
 
-        # Test listing files in root
         if Config.GOOGLE_DRIVE_FOLDER_ID:
-            files = handler.list_files(
-                Config.GOOGLE_DRIVE_FOLDER_ID, limit=5
-            )
-            print(f"Files in {Config.GOOGLE_DRIVE_FOLDER_ID}:")
+            files = handler.get_folder_files(Config.GOOGLE_DRIVE_FOLDER_ID)
+            print(f"Files in folder {Config.GOOGLE_DRIVE_FOLDER_ID}:")
             for f in files:
-                print(f"  - {f['name']} (ID: {f.get('id')})")
+                print(f"  - {f['name']} (ID: {f['id']})")
         else:
-            print("GOOGLE_DRIVE_FOLDER_ID not configured")
+            print("No folder ID set in config")
 
     except Exception as e:
-        print(f"✗ Error: {e}")
+        print(f"Test failed: {e}")

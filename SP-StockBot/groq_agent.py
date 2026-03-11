@@ -2,19 +2,20 @@
 Groq API integration layer for SP-StockBot.
 Handles intent classification, LLM calls with retry logic, and response caching.
 Optimized for free tier: minimal tokens, fast models, caching.
+Direct HTTP to Groq API (no SDK).
 """
 
 import hashlib
 import json
 import time
 from typing import Optional, Dict, Any
+import requests
 from tenacity import (
     retry,
     wait_exponential,
     stop_after_attempt,
     retry_if_exception_type,
 )
-from groq import Groq, RateLimitError, InternalServerError
 
 from config import Config
 from database import Database
@@ -22,17 +23,31 @@ from logger import activity_logger
 
 
 class GroqAgent:
-    """Groq API client with retry, caching, and structured JSON output."""
+    """Groq API client with direct HTTP, retry, caching, and structured JSON output."""
+
+    GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
     def __init__(self, db: Database):
-        """Initialize Groq client."""
+        """Initialize Groq agent."""
         if not Config.GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY not set in environment")
+            raise ValueError(
+                "GROQ_API_KEY not set in environment! "
+                "Please create .env file with: GROQ_API_KEY=gq_XXXXXXXX... "
+                "from https://console.groq.com/keys"
+            )
 
-        # Initialize Groq client with minimal parameters for compatibility
-        self.client = Groq(api_key=Config.GROQ_API_KEY)
+        self.api_key = Config.GROQ_API_KEY
         self.model = Config.GROQ_MODEL
         self.db = db
+        
+        # Log key verification (first 20 chars for debugging)
+        key_preview = f"{self.api_key[:20]}..." if len(self.api_key) > 20 else "SHORT"
+        activity_logger.logger.info(
+            f"[Groq Init] API Key (first 20 chars): {key_preview}"
+        )
+        activity_logger.logger.info(
+            f"[Groq Init] Model: {self.model} | Endpoint: {self.GROQ_API_URL}"
+        )
 
     def _hash_message(self, message: str) -> str:
         """Create hash of message for cache lookup."""
@@ -41,7 +56,7 @@ class GroqAgent:
     @retry(
         wait=wait_exponential(multiplier=1, min=2, max=10),
         stop=stop_after_attempt(3),
-        retry=retry_if_exception_type((RateLimitError, InternalServerError)),
+        retry=retry_if_exception_type((requests.RequestException,)),
         reraise=True,
     )
     def _call_groq_with_retry(
@@ -50,24 +65,109 @@ class GroqAgent:
         temperature: float = 0.3,
         max_tokens: int = 500,
     ) -> Dict[str, Any]:
-        """Call Groq API with exponential backoff retry."""
+        """Call Groq API directly via HTTP with exponential backoff retry."""
         start_time = time.time()
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-        )
-
-        elapsed_ms = (time.time() - start_time) * 1000
-
-        return {
-            "content": response.choices[0].message.content,
-            "tokens_used": response.usage.total_tokens,
-            "elapsed_ms": elapsed_ms,
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
         }
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+
+        try:
+            activity_logger.logger.debug(
+                f"[Groq API] POST {self.GROQ_API_URL} | Model: {self.model} | Max tokens: {max_tokens}"
+            )
+            
+            # Log request details (hide actual key)
+            safe_headers = {
+                "Authorization": f"Bearer {self.api_key[:20]}...",
+                "Content-Type": "application/json",
+            }
+            activity_logger.logger.debug(
+                f"[Groq API Request] Headers: {safe_headers} | Messages count: {len(messages)}"
+            )
+            
+            response = requests.post(
+                self.GROQ_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            
+            # Log the raw response BEFORE processing (for debugging)
+            activity_logger.logger.info(
+                f"[Groq API Response] Status: {response.status_code} | Content-Type: {response.headers.get('content-type')}"
+            )
+            
+            # Log full response body for debugging
+            response_text = response.text if response.text else "(empty)"
+            activity_logger.logger.debug(
+                f"[Groq API Response Body] {response_text[:800]}"
+            )
+            
+            # Check for error status codes BEFORE parsing JSON
+            if response.status_code >= 400:
+                error_detail = response.text[:300]
+                activity_logger.logger.error(
+                    f"[Groq API ERROR] HTTP {response.status_code} | Detail: {error_detail}"
+                )
+                response.raise_for_status()  # Raise exception for retry logic
+            
+            # Parse JSON response
+            result = response.json()
+            elapsed_ms = (time.time() - start_time) * 1000
+
+            # Extract content with defensive coding
+            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            tokens_used = result.get("usage", {}).get("total_tokens", 0)
+            
+            activity_logger.logger.info(
+                f"[Groq API SUCCESS] {tokens_used} tokens in {elapsed_ms:.0f}ms | Content length: {len(content)}"
+            )
+
+            return {
+                "content": content,
+                "tokens_used": tokens_used,
+                "elapsed_ms": elapsed_ms,
+            }
+
+        except requests.exceptions.HTTPError as e:
+            # Handle 401, 429, 500 etc with retry
+            status_code = e.response.status_code if e.response else 0
+            if status_code in (401, 429, 500, 502, 503):
+                activity_logger.logger.warning(
+                    f"[Groq API] HTTP {status_code} - Will retry (tenacity)..."
+                )
+                raise  # Let tenacity retry
+            else:
+                activity_logger.logger.error(
+                    f"[Groq API] HTTP {status_code} - Will NOT retry"
+                )
+                raise
+
+        except requests.exceptions.RequestException as e:
+            activity_logger.logger.error(f"[Groq API] Request Error: {e}")
+            raise
+        
+        except json.JSONDecodeError as e:
+            activity_logger.logger.error(
+                f"[Groq API] JSON Parse Error: {e} | Response was: {response_text[:200]}"
+            )
+            raise
+        
+        except Exception as e:
+            activity_logger.logger.error(
+                f"[Groq API] Unexpected Error: {type(e).__name__} | {e}"
+            )
+            raise
 
     def classify_intent(
         self,
@@ -299,21 +399,41 @@ def get_groq_agent(db: Database) -> GroqAgent:
 
 
 if __name__ == "__main__":
-    # Test the agent
+    # Test the agent with direct HTTP to Groq API
+    import sys
+    import io
+    
+    # Fix Windows console encoding for Unicode
+    if sys.platform == "win32":
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    
     db = Database()
     agent = GroqAgent(db)
 
     # Test intent classification
     test_messages = [
-        "สตอก ทรายอ่อน",
-        "Add user ไผท",
-        "Help me",
-        "Set drive https://drive.google.com/... PIN:1234",
+        "ช่วย",  # Thai help - should return intent "help"
+        "สตอก ทรายอ่อน",  # Check stock
+        "Add user ไผท",  # Admin command
+        "Help me",  # English help
+        "Set drive https://drive.google.com/... PIN:1234",  # Admin set drive
     ]
 
+    print("=" * 60)
+    print("Testing GroqAgent with Direct HTTP to Groq API")
+    print("API Endpoint: https://api.groq.com/openai/v1/chat/completions")
+    print("=" * 60)
+
     for msg in test_messages:
-        print(f"\n📝 Message: {msg}")
-        result = agent.classify_intent(msg, "TestUser", is_admin=True)
-        print(f"Intent: {result.get('intent')}")
-        print(f"Requires PIN: {result.get('requires_pin')}")
-        print(f"Reply: {result.get('reply_text')}")
+        print(f"\n[MESSAGE] {msg}")
+        try:
+            result = agent.classify_intent(msg, "TestUser", is_admin=True)
+            print(f"[INTENT] {result.get('intent')}")
+            print(f"[PIN_REQUIRED] {result.get('requires_pin')}")
+            print(f"[REPLY] {result.get('reply_text')}")
+        except Exception as e:
+            print(f"[ERROR] {type(e).__name__}: {e}")
+
+    print("\n" + "=" * 60)
+    print("Test completed")
+    print("=" * 60)

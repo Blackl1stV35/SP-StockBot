@@ -47,6 +47,18 @@ class JSONFormatter(logging.Formatter):
             log_data["anomalies"] = record.anomalies
         if hasattr(record, "memory"):
             log_data["memory"] = record.memory
+        # Admin action fields
+        if hasattr(record, "action"):
+            log_data["action"] = record.action
+        if hasattr(record, "target"):
+            log_data["target"] = record.target
+        if hasattr(record, "parameters"):
+            log_data["parameters"] = record.parameters
+        if hasattr(record, "success"):
+            log_data["success"] = record.success
+        if hasattr(record, "error_type"):
+            log_data["error_type"] = record.error_type
+
 
         return json.dumps(log_data, ensure_ascii=False)
 
@@ -178,18 +190,34 @@ class ActivityLogger:
 
     def log_admin_action(
         self,
-        admin_id: str,
-        action: str,
+        admin_line_id: Optional[str] = None,
+        action: str = "unknown",
+        admin_id: Optional[str] = None,
         target: Optional[str] = None,
+        target_user: Optional[str] = None,
+        pin_verified: Optional[bool] = None,
         pin_result: Optional[str] = None,
+        parameters: Optional[Dict[str, Any]] = None,
         success: bool = True,
     ) -> None:
-        """Log administrative action."""
+        """
+        Log administrative action.
+        Supports both naming conventions: admin_line_id/admin_id, pin_verified/pin_result, target/target_user.
+        """
+        # Normalize parameters (handle both naming conventions)
+        user_id = admin_line_id or admin_id
+        target_name = target_user or target
+        
+        # Convert pin_verified boolean to pin_result string if needed
+        if pin_verified is not None and pin_result is None:
+            pin_result = "verified" if pin_verified else "failed"
+        
         extra = {
-            "user_id": admin_id,
+            "user_id": user_id,
             "action": action,
-            "target": target,
+            "target": target_name,
             "pin_result": pin_result,
+            "parameters": parameters,
             "success": success,
             "memory": self._get_memory_info(),
         }

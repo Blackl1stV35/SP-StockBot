@@ -1,6 +1,7 @@
 """
 Administrative commands for SP-StockBot.
 Requires PIN verification. Commands: add_user, bulk_add, set_drive, etc.
+FULL MULTIMODAL + DRIVE FINAL + GIT CLEAN 2026-03-12
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -11,15 +12,17 @@ from config import Config
 from database import Database
 from groq_agent import GroqAgent
 from logger import activity_logger
+from drive_handler import DriveHandler
 
 
 class AdminCommands:
     """Handler for admin-only commands."""
 
-    def __init__(self, db: Database, groq_agent: GroqAgent):
+    def __init__(self, db: Database, groq_agent: GroqAgent, drive_handler: Optional[DriveHandler] = None):
         """Initialize admin handler."""
         self.db = db
         self.groq_agent = groq_agent
+        self.drive_handler = drive_handler
 
     def verify_super_admin(self, user_id: str) -> bool:
         """Check if user is super admin."""
@@ -36,12 +39,19 @@ class AdminCommands:
         display_name: str,
         excel_name: Optional[str] = None,
         role: str = "employee",
+        line_user_id: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
-        Add new user to system.
-        display_name: Thai name (e.g. "ไผท(โป๊น)")
-        excel_name: Name as appears in Excel files
-        role: "employee" or "super_admin"
+        Add new user to system and create /Users/[line_user_id]/ folder in Drive.
+        
+        Args:
+            display_name: Thai name (e.g. "ไผท(โป๊น)")
+            excel_name: Name as appears in Excel files
+            role: "employee" or "super_admin"
+            line_user_id: Line user ID (if available from Line webhook)
+        
+        Returns:
+            Tuple of (success: bool, message: str)
         """
         try:
             if not display_name:
@@ -50,22 +60,49 @@ class AdminCommands:
             if role not in ("employee", "super_admin"):
                 return False, "Invalid role"
 
-            # For now, generate a temporary Line ID (in production, get from Line)
-            # This is a placeholder
-            temp_line_id = f"U_placeholder_{display_name}"
+            # Use provided Line ID or generate placeholder
+            if not line_user_id:
+                # In production, this would come from Line webhook
+                line_user_id = f"U_{display_name.replace(' ', '')[:20]}_{int(__import__('time').time())}"
 
             success = self.db.add_user(
-                line_user_id=temp_line_id,
+                line_user_id=line_user_id,
                 display_name=display_name,
                 excel_name=excel_name or display_name,
                 role=role,
             )
 
-            if success:
-                reply = f"✓ User added: {display_name} (Role: {role})"
-                return True, reply
-            else:
+            if not success:
                 return False, "Failed to add user to database"
+            
+            # Create user folder in Drive
+            folder_created = False
+            if self.drive_handler and Config.GOOGLE_DRIVE_FOLDER_ID:
+                try:
+                    folder_name = f"Users/{line_user_id}"
+                    folder_id = self.drive_handler.create_user_folder(
+                        parent_folder_id=Config.GOOGLE_DRIVE_FOLDER_ID,
+                        user_id=line_user_id
+                    )
+                    if folder_id:
+                        activity_logger.logger.info(
+                            f"✓ Created Drive folder for user {display_name}: {folder_id}"
+                        )
+                        folder_created = True
+                    else:
+                        activity_logger.logger.warning(
+                            f"Could not create Drive folder for user {display_name}"
+                        )
+                except Exception as e:
+                    activity_logger.logger.warning(
+                        f"[Drive] Error creating user folder for {display_name}: {e}"
+                    )
+            
+            reply = f"✓ User added: {display_name} (Role: {role}, ID: {line_user_id})"
+            if folder_created:
+                reply += f"\n✓ Drive folder created: /Users/{line_user_id}/"
+            
+            return True, reply
 
         except Exception as e:
             activity_logger.log_error(

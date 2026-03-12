@@ -258,6 +258,74 @@ class DriveHandler:
 
         return folders
 
+    def create_user_folder(self, parent_folder_id: str, user_id: str) -> Optional[str]:
+        """
+        Create /Users/[user_id]/ folder for a new user.
+        This folder is where user-specific documents (XLSX, PDFs) are stored.
+        
+        Args:
+            parent_folder_id: Parent folder ID (e.g., OurFirmInventory)
+            user_id: Line user ID (unique identifier)
+        
+        Returns:
+            Folder ID if created/found, None if failed
+        """
+        if not self.service:
+            activity_logger.logger.warning("[Drive] Service not available for user folder creation")
+            return None
+        
+        try:
+            # Check if Users folder exists first
+            users_folder_name = "Users"
+            query = f"name='{users_folder_name}' and mimeType='application/vnd.google-apps.folder' and '{parent_folder_id}' in parents and trashed=false"
+            response = self.service.files().list(q=query, fields="files(id, name)").execute()
+            users_folder_id = None
+            
+            existing = response.get("files", [])
+            if existing:
+                users_folder_id = existing[0]["id"]
+                activity_logger.logger.debug(f"[Drive] Found existing 'Users' folder: {users_folder_id}")
+            else:
+                # Create Users folder
+                file_metadata = {
+                    "name": users_folder_name,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [parent_folder_id]
+                }
+                folder = self.service.files().create(body=file_metadata, fields="id").execute()
+                users_folder_id = folder.get("id")
+                activity_logger.logger.info(f"[Drive] Created 'Users' folder: {users_folder_id}")
+            
+            if not users_folder_id:
+                return None
+            
+            # Now create user-specific folder under Users
+            user_folder_name = user_id
+            query = f"name='{user_folder_name}' and mimeType='application/vnd.google-apps.folder' and '{users_folder_id}' in parents and trashed=false"
+            response = self.service.files().list(q=query, fields="files(id, name)").execute()
+            
+            existing = response.get("files", [])
+            if existing:
+                user_folder_id = existing[0]["id"]
+                activity_logger.logger.info(f"[Drive] User folder already exists: /Users/{user_id}/ (ID: {user_folder_id})")
+                return user_folder_id
+            
+            # Create user folder
+            file_metadata = {
+                "name": user_folder_name,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [users_folder_id]
+            }
+            folder = self.service.files().create(body=file_metadata, fields="id").execute()
+            user_folder_id = folder.get("id")
+            activity_logger.logger.info(f"[Drive] Created user folder: /Users/{user_id}/ (ID: {user_folder_id})")
+            
+            return user_folder_id
+        
+        except Exception as e:
+            activity_logger.logger.warning(f"[Drive] Error creating user folder for {user_id}: {e}")
+            return None
+
     def upload_file(
         self,
         file_path: str,

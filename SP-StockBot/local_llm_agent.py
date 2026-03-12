@@ -20,6 +20,7 @@ import time
 import re
 import torch
 import string
+import os
 
 try:
     import ollama
@@ -30,6 +31,11 @@ try:
     import google.generativeai as genai
 except ImportError:
     genai = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
 
 from tenacity import retry, stop_after_attempt, wait_fixed
 from config import Config
@@ -42,6 +48,13 @@ class LocalLLMAgent:
     OLLAMA_MODEL = "llama3.2:3b"  # Faster than 8b, uses ~2GB VRAM
     OLLAMA_HOST = "http://127.0.0.1:11434"
     OLLAMA_TIMEOUT = 120  # 2 min timeout for Ollama operations
+    
+    # Fixed commands list for similarity weighting - Gemini uses this for confidence scoring
+    FIXED_COMMANDS = [
+        "add_user", "list_users", "delete_user", "set_drive",
+        "system_stats", "help", "เบิก", "สต็อก", "สถานะ",
+        "report_usage", "check_stock", "admin_help"
+    ]
 
     def __init__(self):
         """Initialize intent parser with Gemini + Ollama + fallback chain."""
@@ -63,6 +76,18 @@ class LocalLLMAgent:
         except Exception as e:
             self.inference_device = "cpu"
             activity_logger.logger.warning(f"[LocalLLM] GPU detection failed: {e}, using CPU")
+        
+        # Initialize embedding model for command similarity scoring
+        self.embedding_model = None
+        if SentenceTransformer:
+            try:
+                model_name = os.getenv('EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
+                self.embedding_model = SentenceTransformer(model_name).to(self.inference_device.split('(')[0].strip())
+                activity_logger.logger.info(f"[Intent] Embedding model loaded: {model_name} on {self.inference_device}")
+            except Exception as e:
+                activity_logger.logger.warning(f"[Intent] Failed to load embedding model: {e}")
+        else:
+            activity_logger.logger.warning("[Intent] SentenceTransformer not installed. Command similarity will be disabled.")
         
         # Initialize Gemini
         if self.gemini_api_key:
@@ -213,43 +238,88 @@ class LocalLLMAgent:
         
         return False, ""
 
+    def _compute_command_similarity(self, user_message: str) -> tuple[str, float]:
+        """
+        Compute cosine similarity between user message and fixed commands list.
+        Returns most similar command and confidence score.
+        
+        Uses embedding-based similarity for English/Thai text.
+        Threshold: >0.7 = valid intent, <0.7 = unknown
+        """
+        if not self.embedding_model:
+            return "unknown", 0.5  # Fallback if embedding model not available
+        
+        try:
+            from sentence_transformers import util
+            
+            # Embed user message
+            msg_embedding = self.embedding_model.encode(user_message, convert_to_tensor=True)
+            
+            # Embed all commands
+            best_match = "unknown"
+            best_score = 0.0
+            
+            for cmd in self.FIXED_COMMANDS:
+                cmd_embedding = self.embedding_model.encode(cmd, convert_to_tensor=True)
+                similarity = util.pytorch_cos_sim(msg_embedding, cmd_embedding)[0][0].item()
+                
+                if similarity > best_score:
+                    best_score = similarity
+                    best_match = cmd
+            
+            activity_logger.logger.debug(
+                f"[Intent] Command similarity: '{user_message[:30]}' → '{best_match}' (score: {best_score:.3f})"
+            )
+            
+            return best_match, min(best_score, 1.0)  # Cap confidence at 1.0
+        
+        except Exception as e:
+            activity_logger.logger.debug(f"[Intent] Command similarity compute failed: {e}")
+            return "unknown", 0.5
+
     def _gemini_intent_parse(self, user_message: str, user_name: str = "User") -> Optional[Dict[str, Any]]:
         """
         Parse intent using Gemini API (free tier: 1.5 Flash or 2.0).
+        Uses fixed commands list for similarity weighting.
+        Confidence >0.7 = valid intent, <0.7 = unknown
+        
         Returns intent dict or None if failed/rate-limited.
         """
         if not self.gemini_api_key or genai is None:
             return None
         
         try:
+            # First, compute similarity to fixed commands for confidence weighting
+            matched_command, cmd_similarity = self._compute_command_similarity(user_message)
+            
             model = genai.GenerativeModel(self.gemini_model)
             
             prompt = f"""You are an AI assistant for a car repair shop inventory system.
 Classify the user's intent from Thai/English text.
+User commands must match: {', '.join(self.FIXED_COMMANDS)}
 
 User: {user_name}
 Message: {user_message}
 
 IMPORTANT: Respond ONLY with valid JSON (no markdown, no backticks), exactly like this:
-{{"intent": "report_usage", "material": "", "quantity": 0, "confidence": 0.95}}
+{{"intent": "report_usage", "command_match": "เบิก", "material": "", "quantity": 0, "confidence": 0.95}}
 
 Rules:
-1. Intent types:
-   - "report_usage": User wants to withdraw/use materials (keywords: เบิก, ใช้, ถอน, ส่ง)
-   - "check_stock": User wants to check inventory (keywords: สต็อก, ตรวจสอบ, เหลือ, มีไหม)
-   - "help": User needs help/guide (keywords: help, วิธี, ช่วย, คำสั่ง)  
-   - "system_info": User asks about system (keywords: ระบบ, สถานะ, ข้อมูล)
-   - "other": Doesn't clearly fit above
-
-2. Extract:
-   - Material name if mentioned
-   - Quantity (number) if mentioned
+1. Intent types (match to FIXED_COMMANDS):
+   - "report_usage" (เบิก): User wants to withdraw/use materials
+   - "check_stock" (สต็อก): User wants to check inventory
+   - "admin_help" (help/admin): User needs admin help/guide
+   - "system_stats": User asks about system status/info
+   - "unknown": Doesn't clearly fit above
    
-3. Confidence:
-   - 0.95: Very clear intent with specific material/qty
-   - 0.85: Clear intent, some details missing
-   - 0.7: Somewhat ambiguous but reasonable guess
-   - 0.5: Very ambiguous
+2. command_match: Closest matching fixed command from list
+3. Extract material and quantity if mentioned
+4. Confidence:
+   - 0.95: Very clear, exact command match
+   - 0.85: Clear intent, close command match
+   - 0.7: Reasonable match (use for confidence >0.7 threshold)
+   - 0.5: Ambiguous (below 0.7 threshold = unknown)
+   - Use command_match similarity for weighting
 """
             
             response = model.generate_content(prompt, request_options={"timeout": 30})
@@ -267,19 +337,29 @@ Rules:
             
             data = json.loads(text)
             
+            # Use command similarity to weight final confidence
+            conf_from_gemini = float(data.get("confidence", 0.5))
+            # Weight confidence: 50% from Gemini, 50% from command similarity
+            final_confidence = 0.5 * conf_from_gemini + 0.5 * cmd_similarity
+            
             result = {
-                "intent": data.get("intent", "other"),
+                "intent": data.get("intent", "unknown"),
                 "parameters": {
                     "material": data.get("material", ""),
-                    "quantity": int(data.get("quantity", 0)) if data.get("quantity") else 0
+                    "quantity": int(data.get("quantity", 0)) if data.get("quantity") else 0,
+                    "command_match": data.get("command_match", matched_command)
                 },
-                "confidence": float(data.get("confidence", 0.5)),
+                "confidence": final_confidence,
                 "parser": "gemini"
             }
             
+            # Reject if confidence < 0.7
+            if final_confidence < 0.7:
+                result["intent"] = "unknown"
+            
             activity_logger.logger.info(
                 f"[Intent] {user_message[:40]} → {result['intent']} "
-                f"(conf: {result['confidence']:.2f}, Gemini)"
+                f"(cmd: {matched_command}, conf: {final_confidence:.2f}, Gemini+sim)"
             )
             return result
         

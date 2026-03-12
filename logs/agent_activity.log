@@ -452,3 +452,16 @@
 {"timestamp": "2026-03-12T19:23:47.050363", "level": "INFO", "logger": "SP-StockBot", "message": "[Intent] nonsense garbage 123 !!! → report_usage (conf: 0.8, Ollama)"}
 {"timestamp": "2026-03-12T19:23:47.052547", "level": "INFO", "logger": "SP-StockBot", "message": "✓ Loaded service account from D:\\stock-monitor-line\\SP-StockBot\\nth-station-489109-s1-6c5ccb8ccef4.json"}
 {"timestamp": "2026-03-12T19:23:47.182266", "level": "INFO", "logger": "SP-StockBot", "message": "✓ Google Drive authenticated successfully"}
+{"timestamp": "2026-03-12T19:32:20.010776", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] CUDA available: NVIDIA GeForce GTX 1650"}
+{"timestamp": "2026-03-12T19:32:20.010776", "level": "INFO", "logger": "SP-StockBot", "message": "[Gemini] Configured with model: gemini-1.5-flash"}
+{"timestamp": "2026-03-12T19:32:20.609690", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] Ollama client created | Host: http://127.0.0.1:11434 | Timeout: 120s"}
+{"timestamp": "2026-03-12T19:32:20.615932", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] Checking Ollama server connectivity..."}
+{"timestamp": "2026-03-12T19:32:20.644792", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] ✓ Ollama server reachable | Models available: 3"}
+{"timestamp": "2026-03-12T19:32:20.646005", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] Starting Ollama model warm-up..."}
+{"timestamp": "2026-03-12T19:32:30.813953", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] ✓ Warm-up successful (10.2s)"}
+{"timestamp": "2026-03-12T19:32:30.815027", "level": "WARNING", "logger": "SP-StockBot", "message": "[Intent] Spam detected: High entropy (random characters)"}
+{"timestamp": "2026-03-12T19:32:30.816239", "level": "WARNING", "logger": "SP-StockBot", "message": "[Intent] Spam detected: High entropy (random characters)"}
+{"timestamp": "2026-03-12T19:32:33.559782", "level": "INFO", "logger": "SP-StockBot", "message": "[Intent] ช่วยด้วย → help (conf: 0.8, Ollama)"}
+{"timestamp": "2026-03-12T19:32:35.767534", "level": "INFO", "logger": "SP-StockBot", "message": "[Intent] nonsense garbage 123 !!! → other (conf: 0.5, Ollama)"}
+{"timestamp": "2026-03-12T19:32:35.769836", "level": "INFO", "logger": "SP-StockBot", "message": "✓ Loaded service account from D:\\stock-monitor-line\\SP-StockBot\\nth-station-489109-s1-6c5ccb8ccef4.json"}
+{"timestamp": "2026-03-12T19:32:35.888176", "level": "INFO", "logger": "SP-StockBot", "message": "✓ Google Drive authenticated successfully"}

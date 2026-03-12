@@ -123,6 +123,104 @@ class DriveHandler:
             )
             return []
 
+    def scan_recursive(self, folder_id: str, file_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Recursively scan folder and all subfolders for files.
+        Also returns root-level files (loose XLSX at target folder level).
+        
+        Args:
+            folder_id: Root folder to scan
+            file_types: List of file types to find ['xlsx', 'pdf', 'docx'] or None for all
+        
+        Returns:
+            List of file dicts with 'id', 'name', 'path', 'mimeType', 'size'
+        """
+        if not self.service:
+            activity_logger.logger.warning("[Drive] Service not available")
+            return []
+        
+        if not file_types:
+            file_types = ['xlsx', 'pdf', 'docx']
+        
+        mime_types = {
+            'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'pdf': 'application/pdf',
+            'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        }
+        
+        found_files = []
+        visited_folders = set()
+        
+        def scan_folder(folder_id_curr: str, path_prefix: str = ""):
+            """Helper: recursively scan a folder."""
+            if folder_id_curr in visited_folders:
+                return
+            visited_folders.add(folder_id_curr)
+            
+            try:
+                # Query all items in this folder
+                query = f"'{folder_id_curr}' in parents and trashed=false"
+                
+                results = self.service.files().list(
+                    q=query,
+                    spaces="drive",
+                    fields="files(id, name, mimeType, createdTime, size)",
+                    pageSize=100
+                ).execute()
+                
+                items = results.get("files", [])
+                activity_logger.logger.debug(
+                    f"[Drive] Scan: {folder_id_curr[:8]}... found {len(items)} items at path '{path_prefix}'"
+                )
+                
+                for item in items:
+                    item_name = item.get('name', 'Unknown')
+                    item_mime = item.get('mimeType', '')
+                    item_id = item.get('id', '')
+                    item_path = f"{path_prefix}/{item_name}" if path_prefix else item_name
+                    
+                    # Process file if matches desired types
+                    if item_mime != 'application/vnd.google-apps.folder':
+                        # Check if this is a wanted file type
+                        for ft in file_types:
+                            if mime_types[ft] == item_mime:
+                                found_files.append({
+                                    'id': item_id,
+                                    'name': item_name,
+                                    'path': item_path,
+                                    'mimeType': item_mime,
+                                    'size': item.get('size', 0),
+                                    'createdTime': item.get('createdTime', '')
+                                })
+                                activity_logger.logger.debug(
+                                    f"[Drive] Found: {item_path} ({item_mime})"
+                                )
+                                break
+                    else:
+                        # Recursively scan subfolder
+                        scan_folder(item_id, item_path)
+                
+            except Exception as e:
+                activity_logger.logger.warning(
+                    f"[Drive] Error scanning {folder_id_curr}: {e}"
+                )
+        
+        # Start recursive scan
+        activity_logger.logger.info(
+            f"[Drive] Starting recursive scan of {folder_id} for types: {file_types}"
+        )
+        scan_folder(folder_id)
+        
+        activity_logger.logger.info(
+            f"[Drive] Recursive scan complete: found {len(found_files)} files"
+        )
+        for f in found_files:
+            activity_logger.logger.info(
+                f"[Drive] - {f['path']} ({f.get('size', 0)} bytes)"
+            )
+        
+        return found_files
+
     def create_folder_structure(self, parent_folder_id: str = None) -> Dict[str, str]:
         """
         Create standard folder structure if needed.

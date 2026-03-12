@@ -11,6 +11,7 @@ import sys
 import os
 import re
 import json
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 from contextlib import asynccontextmanager
@@ -850,8 +851,8 @@ def check_drive_for_new_files():
     """
     try:
         activity_logger.logger.info(
-            f"▶ [Drive Scan] Starting background file scan (with vector extraction) | "
-            f"Folder ID: {Config.GOOGLE_DRIVE_FOLDER_ID}"
+            f"▶ [Drive Scan] Starting recursive file scan with vector extraction | "
+            f"Folder ID: {Config.GOOGLE_DRIVE_FOLDER_ID} (DRIVE SCANNER FIXED 2026-03-12)"
         )
 
         if not Config.GOOGLE_DRIVE_FOLDER_ID:
@@ -867,88 +868,96 @@ def check_drive_for_new_files():
             )
             return
 
-        # Query per-user folders (Users/*)
-        try:
-            user_folders_results = drive.service.files().list(
-                q=f"'{Config.GOOGLE_DRIVE_FOLDER_ID}' in parents and name contains 'Users/' and mimeType='application/vnd.google-apps.folder'",
-                spaces='drive',
-                fields='files(id, name)',
-                pageSize=50
-            ).execute()
-            
-            user_folders = user_folders_results.get('files', [])
-            activity_logger.logger.info(f"[Drive Scan] Found {len(user_folders)} user folders")
-        except Exception as e:
-            activity_logger.logger.warning(f"Error querying user folders: {e}")
-            user_folders = []
+        # Use recursive scanner to find all XLSX/PDF/DOCX files (including at root)
+        # DRIVE SCANNER FIXED 2026-03-12: Now finds loose files + all subfolders
+        all_files = drive.scan_recursive(
+            folder_id=Config.GOOGLE_DRIVE_FOLDER_ID,
+            file_types=['xlsx', 'pdf', 'docx']
+        )
         
-        # Process each user folder
-        for user_folder in user_folders:
+        activity_logger.logger.info(
+            f"[Drive Scan] Found {len(all_files)} files total (XLSX/PDF/DOCX) after recursive scan"
+        )
+
+        # Process each file
+        processed_count = 0
+        skipped_count = 0
+        failed_count = 0
+        
+        for file_info in all_files:
             try:
-                user_id = user_folder['name'].split('/')[-1]
-                folder_id = user_folder['id']
+                file_id = file_info['id']
+                file_name = file_info['name']
+                file_path = file_info['path']
+                mime_type = file_info['mimeType']
                 
-                activity_logger.logger.debug(f"[Drive Scan] Processing user folder: {user_id}")
+                activity_logger.logger.debug(
+                    f"[Drive Scan] Processing: {file_path} (type: {mime_type}) | ID: {file_id}"
+                )
                 
-                # List files in user folder
-                files_results = drive.service.files().list(
-                    q=f"'{folder_id}' in parents and trashed=false",
-                    spaces='drive',
-                    fields='files(id, name, mimeType)',
-                    pageSize=10
-                ).execute()
+                # Check if already processed
+                db_instance = get_db()
+                processed = db_instance.get_processed_file(file_id)
+                if processed:
+                    activity_logger.logger.debug(f"[Drive Scan] File already processed: {file_name}")
+                    skipped_count += 1
+                    continue
                 
-                files = files_results.get('files', [])
+                # Extract user ID from path (if available, else use 'system')
+                # Path format: "Stock_2569/Q1/file.xlsx" or "file.xlsx"
+                try:
+                    path_parts = file_path.split('/')
+                    # Try to extract user ID from folder structure
+                    user_id = 'system'
+                    if len(path_parts) > 1:
+                        # Use first meaningful folder as user_id
+                        for part in path_parts[:-1]:
+                            if part and part != '.' and not part.startswith('_'):
+                                user_id = part
+                                break
+                except:
+                    user_id = 'system'
                 
-                for file in files:
-                    try:
-                        file_id = file.get('id')
-                        file_name = file.get('name')
-                        mime_type = file.get('mimeType', '')
-                        
-                        # Check if already processed
-                        db_instance = get_db()
-                        processed = db_instance.get_processed_file(file_id)
-                        if processed:
-                            activity_logger.logger.debug(f"File already processed: {file_name}")
-                            continue
-                        
-                        # Extract and embed
-                        success = extract_and_embed_file(file_id, file_name, mime_type, user_id, drive)
-                        
-                        if success:
-                            # Mark as processed
-                            db_instance.mark_file_processed(
-                                file_id=file_id,
-                                file_name=file_name,
-                                records_count=1
-                            )
-                            
-                            # Delete file from Drive
-                            try:
-                                drive.service.files().delete(fileId=file_id).execute()
-                                activity_logger.logger.info(f"✓ Deleted file after extraction: {file_name}")
-                            except Exception as e:
-                                activity_logger.logger.warning(f"Could not delete file {file_name}: {e}")
-                            
-                            # Notify user
-                            user_display_name = db_instance.get_user(user_id)
-                            if user_display_name:
-                                display_name = user_display_name.get('display_name', user_id)
-                                send_alert_flex_message(
-                                    user_id,
-                                    "File Processed",
-                                    f"✓ Successfully extracted and embedded: {file_name}",
-                                    "info"
-                                )
+                # Extract and embed
+                success = extract_and_embed_file(file_id, file_name, mime_type, user_id, drive)
+                
+                if success:
+                    processed_count += 1
+                    # Mark as processed
+                    db_instance.mark_file_processed(
+                        file_id=file_id,
+                        file_name=file_name,
+                        records_count=1
+                    )
                     
+                    # Delete file from Drive (if enabled)
+                    try:
+                        drive.service.files().delete(fileId=file_id).execute()
+                        activity_logger.logger.info(f"✓ Deleted file after extraction: {file_name}")
                     except Exception as e:
-                        activity_logger.logger.error(f"Error processing file {file_name}: {e}")
-            
+                        activity_logger.logger.warning(f"Could not delete file {file_name}: {e}")
+                    
+                    # Notify user if not system
+                    if user_id != 'system':
+                        try:
+                            send_alert_flex_message(
+                                user_id,
+                                "File Processed",
+                                f"✓ Successfully extracted and embedded: {file_name}",
+                                "info"
+                            )
+                        except:
+                            pass  # User may not have Line account
+                else:
+                    failed_count += 1
+                
             except Exception as e:
-                activity_logger.logger.error(f"Error processing user folder: {e}")
+                activity_logger.logger.error(f"[Drive Scan] Error processing file {file_name}: {e}")
+                failed_count += 1
         
-        activity_logger.logger.info("✓ Drive scan completed")
+        activity_logger.logger.info(
+            f"✓ Drive scan completed | Processed: {processed_count}, Skipped: {skipped_count}, Failed: {failed_count}"
+        )
 
     except Exception as e:
         activity_logger.log_error(
@@ -1260,6 +1269,61 @@ async def health_check() -> Dict[str, Any]:
         )
 
 
+# OLLAMA PYTHON CLIENT FIXED 2026-03-12: Test endpoint for Ollama connectivity
+@app.get("/api/ollama-test", tags=["System"])
+async def test_ollama_inference() -> Dict[str, Any]:
+    """
+    Test Ollama inference latency and connectivity.
+    GET /api/ollama-test → Returns response time, device, model info
+    """
+    try:
+        agent = get_local_llm_agent()
+        if not agent:
+            return ORJSONResponse({
+                "status": "error",
+                "error": "LLM agent not available"
+            }, status_code=500)
+        
+        if not agent.server_healthy:
+            return ORJSONResponse({
+                "status": "error",
+                "error": "Ollama server unreachable",
+                "host": agent.OLLAMA_HOST
+            }, status_code=503)
+        
+        # Run test inference
+        start = time.time()
+        test_prompt = "Say 'Ollama working' briefly."
+        response = agent._call_ollama_api(test_prompt, timeout_secs=60)
+        elapsed = time.time() - start
+        
+        if response:
+            return ORJSONResponse({
+                "status": "ok",
+                "model": agent.OLLAMA_MODEL,
+                "device": agent.inference_device,
+                "latency_seconds": round(elapsed, 2),
+                "response_snippet": response[:100],
+                "host": agent.OLLAMA_HOST,
+                "timeout_seconds": agent.OLLAMA_TIMEOUT,
+            })
+        else:
+            return ORJSONResponse({
+                "status": "error",
+                "error": "Inference returned empty response",
+                "model": agent.OLLAMA_MODEL,
+                "device": agent.inference_device,
+                "latency_seconds": round(elapsed, 2),
+            }, status_code=500)
+    
+    except Exception as e:
+        activity_logger.logger.error(f"[Ollama Test] Exception: {e}")
+        return ORJSONResponse({
+            "status": "error",
+            "error": str(e)
+        }, status_code=500)
+
+
 # Line webhook callback
 @app.post("/callback", tags=["Line Bot"])
 async def line_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -1333,19 +1397,42 @@ def handle_message(event: MessageEvent):
             )
             return
 
-        # Classify intent using local LLM (Ollama) - LOCAL SHIFT 2026-03-12
-        intent_result = agent.classify_intent(
+        # Classify intent using Gemini→Ollama→Fallback chain (GEMINI INTEGRATED 2026-03-12)
+        intent_result = agent.parse_intent(
             user_message=user_message,
             user_name=user.get("display_name", "User"),
-            is_admin=is_admin,
         )
 
         intent = intent_result.get("intent", "other")
         confidence = intent_result.get("confidence", 0.0)
+        parser_used = intent_result.get("parser", "unknown")
         requires_pin = intent_result.get("requires_pin", False)
         reply_text = intent_result.get("reply_text", "")
+        
+        # Log which parser succeeded
+        activity_logger.logger.info(
+            f"[Intent] Message by {user_id}: intent={intent} (conf={confidence:.2f}, parser={parser_used})"
+        )
 
-        # LOCAL SHIFT 2026-03-12: Embed all messages for internal AI learning
+        # Reject spam/nonsense
+        if intent == "spam":
+            reply_text = (
+                "❌ Invalid input. Please send a valid request.\n"
+                "Examples:\n"
+                "- เบิก กดทห80\n"
+                "- สต็อก วัสดุใดบ้าง\n"
+                "- ช่วยด้วย"
+            )
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]
+                )
+            )
+            activity_logger.logger.warning(f"[Intent] Spam detected from {user_id}: {user_message[:50]}")
+            return
+
+        # GEMINI INTEGRATED 2026-03-12: Embed all messages for internal AI learning
         embed_message(
             text=user_message,
             user_id=user_id,
@@ -1353,11 +1440,13 @@ def handle_message(event: MessageEvent):
                 'intent': intent,
                 'material': intent_result.get("parameters", {}).get("material", ""),
                 'quantity': intent_result.get("parameters", {}).get("quantity", 0),
+                'confidence': confidence,
+                'parser': parser_used,
                 'timestamp': datetime.now(tz=BKK_TZ).isoformat()
             }
         )
 
-        # LOCAL SHIFT 2026-03-12: Check if we should suggest clarification (RL policy)
+        # Check if we should suggest clarification (RL policy)
         if suggest_interaction(user_id, intent, confidence):
             # Send clarification suggestion (but not aggressively)
             activity_logger.logger.debug(f"[RL] Suggesting clarification for: {user_id}")

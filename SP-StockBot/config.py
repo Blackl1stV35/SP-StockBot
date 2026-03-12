@@ -56,6 +56,12 @@ class Config:
     # GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")  # LOCAL OLLAMA FIXED 2026-03-12: No longer used
     # GROQ_MODEL: str = "llama-3.1-8b-instant"  # Deprecated
 
+    # ==================== GEMINI API (FREE TIER - INTEGRATED 2026-03-12) ====================
+    # Free: 1M context window, 15 RPM, 1500 RPD, 1M TPM
+    # Models: gemini-1.5-flash (cheaper), gemini-2.0-flash (faster)
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
     # ==================== GOOGLE DRIVE ====================
     GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str] = os.getenv(
         "GOOGLE_SERVICE_ACCOUNT_JSON", None

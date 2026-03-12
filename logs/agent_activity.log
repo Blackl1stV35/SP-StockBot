@@ -439,3 +439,16 @@
 {"timestamp": "2026-03-11T19:00:21.757712", "level": "INFO", "logger": "SP-StockBot", "message": "Admin action: list_users | ✓ Success", "user_id": "U67936b68b8b22bace43483b1bb736d27", "pin_result": "verified", "memory": {"process_rss_mb": 56.16, "process_vms_mb": 1409.64, "system_used_gb": 6.67, "system_available_gb": 0.67, "system_percent": 90.9}, "action": "list_users", "target": null, "parameters": null, "success": true}
 {"timestamp": "2026-03-11T19:00:21.989888", "level": "INFO", "logger": "SP-StockBot", "message": "Message processed: U67936b68b8b22bace43483b1bb736d27 | Intent: error | Result: success", "user_id": "U67936b68b8b22bace43483b1bb736d27", "intent": "error", "memory": {"process_rss_mb": 56.18, "process_vms_mb": 1409.64, "system_used_gb": 6.62, "system_available_gb": 0.72, "system_percent": 90.2}}
 {"timestamp": "2026-03-11T19:00:54.405441", "level": "ERROR", "logger": "SP-StockBot", "message": "Shutdown error: 'Database' object has no attribute 'close'", "user_id": null, "memory": {"process_rss_mb": 48.48, "process_vms_mb": 1409.63, "system_used_gb": 6.81, "system_available_gb": 0.53, "system_percent": 92.8}, "error_type": "shutdown_error"}
+{"timestamp": "2026-03-12T19:23:30.724426", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] CUDA available: NVIDIA GeForce GTX 1650"}
+{"timestamp": "2026-03-12T19:23:30.725420", "level": "WARNING", "logger": "SP-StockBot", "message": "[Gemini] No API key found. Using Ollama + fallback only."}
+{"timestamp": "2026-03-12T19:23:31.363943", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] Ollama client created | Host: http://127.0.0.1:11434 | Timeout: 120s"}
+{"timestamp": "2026-03-12T19:23:31.363943", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] Checking Ollama server connectivity..."}
+{"timestamp": "2026-03-12T19:23:31.454921", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] ✓ Ollama server reachable | Models available: 3"}
+{"timestamp": "2026-03-12T19:23:31.455428", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] Starting Ollama model warm-up..."}
+{"timestamp": "2026-03-12T19:23:42.638066", "level": "INFO", "logger": "SP-StockBot", "message": "[LocalLLM] ✓ Warm-up successful (11.2s)"}
+{"timestamp": "2026-03-12T19:23:42.638578", "level": "WARNING", "logger": "SP-StockBot", "message": "[Intent] Spam detected: High entropy (random characters)"}
+{"timestamp": "2026-03-12T19:23:42.640012", "level": "WARNING", "logger": "SP-StockBot", "message": "[Intent] Spam detected: High entropy (random characters)"}
+{"timestamp": "2026-03-12T19:23:44.854822", "level": "INFO", "logger": "SP-StockBot", "message": "[Intent] ช่วยด้วย → help (conf: 0.8, Ollama)"}
+{"timestamp": "2026-03-12T19:23:47.050363", "level": "INFO", "logger": "SP-StockBot", "message": "[Intent] nonsense garbage 123 !!! → report_usage (conf: 0.8, Ollama)"}
+{"timestamp": "2026-03-12T19:23:47.052547", "level": "INFO", "logger": "SP-StockBot", "message": "✓ Loaded service account from D:\\stock-monitor-line\\SP-StockBot\\nth-station-489109-s1-6c5ccb8ccef4.json"}
+{"timestamp": "2026-03-12T19:23:47.182266", "level": "INFO", "logger": "SP-StockBot", "message": "✓ Google Drive authenticated successfully"}

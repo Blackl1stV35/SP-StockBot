@@ -22,6 +22,9 @@ torch>=2.0.0
 # Local AI - Ollama (LLM inference)
 ollama>=0.1.0
 
+# Gemini API (Free tier: 1M context, 15 RPM, 1500 RPD)
+google-generativeai>=0.3.0
+
 # Multimodal support (FREE tools)
 easyocr>=1.7.0
 vosk>=0.3.21

@@ -11,7 +11,7 @@ import sys
 import os
 import re
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 from contextlib import asynccontextmanager
 import tempfile
@@ -27,7 +27,7 @@ from chromadb import PersistentClient
 from sentence_transformers import SentenceTransformer
 
 # Line Bot SDK v3
-from linebot.v3.messaging import MessagingApi, ApiClient, TextMessage, ReplyMessageRequest, FlexSendMessage
+from linebot.v3.messaging import MessagingApi, ApiClient, TextMessage, ReplyMessageRequest, FlexMessage
 from linebot.v3.webhook import WebhookHandler, MessageEvent
 from linebot.v3.webhooks import TextMessageContent
 from linebot.v3.exceptions import InvalidSignatureError
@@ -36,7 +36,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import Config
 from database import Database
-from groq_agent import GroqAgent
+from local_llm_agent import LocalLLMAgent  # LOCAL SHIFT 2026-03-12: Replace Groq with local Ollama
 from drive_handler import DriveHandler
 from xlsx_parser import XlsxParser
 from anomaly_detector import AnomalyDetector
@@ -46,6 +46,9 @@ from commands.employee_commands import EmployeeCommands
 
 # Background scheduler (initialized before app for use in lifespan)
 scheduler = BackgroundScheduler()
+
+# LOCAL OLLAMA FIXED 2026-03-12: Bangkok timezone constant
+BKK_TZ = timezone(timedelta(hours=7))
 
 # ==================== VECTOR DB & EMBEDDINGS INITIALIZATION ====================
 # Initialize vector DB
@@ -64,8 +67,95 @@ embedding_model = SentenceTransformer(model_name).to(device)
 
 activity_logger.logger.info(f"Vector DB initialized at {vector_db_path}")
 activity_logger.logger.info(f"Embeddings model: {model_name} on device: {device}")
+activity_logger.logger.info(f"[LOCAL SHIFT 2026-03-12] Using local LLM (Ollama) instead of Groq cloud")
 
 # ==================== HELPER FUNCTIONS FOR VECTOR OPERATIONS ====================
+
+# ==================== LOCAL AI FUNCTIONS ====================
+
+def embed_message(text: str, user_id: str, metadata: Dict[str, Any]) -> bool:
+    """
+    Always embed user message as internal AI assistant observation.
+    Captures full context: user message, timestamp, intent, metadata.
+    
+    LOCAL SHIFT 2026-03-12: Every message becomes a learning point.
+    
+    Args:
+        text: User message text (original)
+        user_id: Line user ID
+        metadata: Dict with intent, material, qty, timestamp, etc.
+        
+    Returns:
+        True if embedded, False if failed
+    """
+    try:
+        # Embed in behavior collection (internal observations)
+        doc_id = f"message_{user_id}_{metadata.get('timestamp', '')}"
+        embed_and_upsert(
+            text=text,
+            doc_id=doc_id,
+            collection_ref=behavior_collection,
+            metadata={
+                'user_id': user_id,
+                'type': 'message',
+                'intent': metadata.get('intent', ''),
+                'material': metadata.get('material', ''),
+                'quantity': metadata.get('quantity', 0),
+                'timestamp': metadata.get('timestamp', datetime.now(tz=BKK_TZ).isoformat())
+            }
+        )
+        return True
+    except Exception as e:
+        activity_logger.logger.warning(f"Failed to embed message: {e}")
+        return False
+
+
+def suggest_interaction(user_id: str, intent: str, confidence: float) -> bool:
+    """
+    RL policy stub: Suggest follow-up if user message was ambiguous.
+    
+    Simple rule-based approach (no heavy ML):
+    - If confidence < 0.6: suggest clarification
+    - If intent='other': suggest help menu
+    - Mechanics are busy: no aggressive follow-up
+    
+    Reward model (future DQN):
+      +1.0: user confirms clarification
+      +0.5: user completes action (report/check)
+       0.0: user ignores suggestion (OK - they're busy)
+      -0.5: user negative feedback (avoid pattern)
+    
+    LOCAL SHIFT 2026-03-12: Observational + non-intrusive
+    
+    Args:
+        user_id: Line user ID
+        intent: Classified intent from LLM
+        confidence: Confidence score 0.0-1.0
+        
+    Returns:
+        True if suggestion should be sent, False if stay silent
+    """
+    # For now: only suggest if very ambiguous (confidence < 0.5)
+    if confidence < 0.5 and intent == 'other':
+        return True
+    # Never be aggressive - mechanics are busy
+    return False
+
+
+def get_inference_device() -> str:
+    """
+    Get current inference device (Ollama chooses GPU or CPU).
+    LOCAL SHIFT 2026-03-12
+    """
+    try:
+        # Check if torch CUDA available (for embeddings)
+        if torch.cuda.is_available():
+            return f"cuda ({torch.cuda.get_device_name(0)})"
+        else:
+            return "cpu"
+    except:
+        return "cpu"
+
 
 def parse_quantity(text: str) -> int:
     """
@@ -203,7 +293,7 @@ def register_user_with_vector_profile(user_id: str, display_name: str) -> bool:
             activity_logger.logger.warning(f"Could not create Drive folder for {user_id}: {e}")
         
         # Embed user profile in vector DB
-        profile_text = f"User: {display_name} (ID: {user_id}), registered {datetime.now(tz=timezone('Asia/Bangkok')).isoformat()}"
+        profile_text = f"User: {display_name} (ID: {user_id}), registered {datetime.now(tz=BKK_TZ).isoformat()}"
         embed_and_upsert(
             text=profile_text,
             doc_id=f"user_profile_{user_id}",
@@ -212,7 +302,7 @@ def register_user_with_vector_profile(user_id: str, display_name: str) -> bool:
                 'user_id': user_id,
                 'type': 'profile',
                 'display_name': display_name,
-                'registered_at': datetime.now(tz=timezone('Asia/Bangkok')).isoformat()
+                'registered_at': datetime.now(tz=BKK_TZ).isoformat()
             }
         )
         
@@ -226,7 +316,7 @@ def register_user_with_vector_profile(user_id: str, display_name: str) -> bool:
             metadata={
                 'user_id': user_id,
                 'type': 'registration',
-                'timestamp': datetime.now(tz=timezone('Asia/Bangkok')).isoformat()
+                'timestamp': datetime.now(tz=BKK_TZ).isoformat()
             }
         )
         
@@ -255,7 +345,7 @@ def handle_inventory_report(user_id: str, display_name: str, material: str, quan
         qty = parse_quantity(quantity_str)
         
         # Create narrative for embedding
-        narrative = f"{display_name} reported {qty} of {material} at {datetime.now(tz=timezone('Asia/Bangkok')).isoformat()}"
+        narrative = f"{display_name} reported {qty} of {material} at {datetime.now(tz=BKK_TZ).isoformat()}"
         
         # Embed in inventory collection
         doc_id = f"report_{user_id}_{material}_{datetime.now().timestamp()}"
@@ -268,7 +358,7 @@ def handle_inventory_report(user_id: str, display_name: str, material: str, quan
                 'type': 'report',
                 'material': material,
                 'quantity': qty,
-                'reported_at': datetime.now(tz=timezone('Asia/Bangkok')).isoformat()
+                'reported_at': datetime.now(tz=BKK_TZ).isoformat()
             }
         )
         
@@ -284,7 +374,7 @@ def handle_inventory_report(user_id: str, display_name: str, material: str, quan
                 'type': 'report',
                 'material': material,
                 'quantity': qty,
-                'timestamp': datetime.now(tz=timezone('Asia/Bangkok')).isoformat()
+                'timestamp': datetime.now(tz=BKK_TZ).isoformat()
             }
         )
         
@@ -353,7 +443,7 @@ def send_report_flex_message(user_id: str, display_name: str):
         
         # Generate Flex message
         flex_content = get_report_flex(display_name, materials)
-        flex_message = FlexSendMessage(
+        flex_message = FlexMessage(
             alt_text="Inventory Report",
             contents=flex_content
         )
@@ -379,7 +469,7 @@ def send_alert_flex_message(user_id: str, alert_title: str, alert_message: str, 
         from utils import get_alert_flex
         
         flex_content = get_alert_flex(alert_title, alert_message, severity)
-        flex_message = FlexSendMessage(
+        flex_message = FlexMessage(
             alt_text=alert_title,
             contents=flex_content
         )
@@ -404,7 +494,7 @@ def send_stock_check_flex_message(user_id: str, display_name: str, materials: li
         from utils import get_stock_check_flex
         
         flex_content = get_stock_check_flex(materials, display_name)
-        flex_message = FlexSendMessage(
+        flex_message = FlexMessage(
             alt_text="Stock Check",
             contents=flex_content
         )
@@ -450,7 +540,7 @@ async def lifespan(app: FastAPI):
 
         # Initialize components
         get_db()
-        get_groq_agent()
+        get_local_llm_agent()  # LOCAL SHIFT 2026-03-12: Local Ollama instead of Groq
         get_admin_commands()
         get_employee_commands()
         get_drive_handler()
@@ -539,7 +629,7 @@ webhook_handler = WebhookHandler(Config.LINE_CHANNEL_SECRET)
 
 # Initialize components (lazy loaded)
 db: Optional[Database] = None
-groq_agent: Optional[GroqAgent] = None
+local_llm_agent: Optional[LocalLLMAgent] = None  # LOCAL SHIFT 2026-03-12
 drive_handler: Optional[DriveHandler] = None
 xlsx_parser: Optional[XlsxParser] = None
 anomaly_detector: Optional[AnomalyDetector] = None
@@ -555,12 +645,12 @@ def get_db() -> Database:
     return db
 
 
-def get_groq_agent() -> GroqAgent:
-    """Get or initialize Groq agent."""
-    global groq_agent
-    if groq_agent is None:
-        groq_agent = GroqAgent(get_db())
-    return groq_agent
+def get_local_llm_agent() -> LocalLLMAgent:  # LOCAL SHIFT 2026-03-12: Replace Groq with local Ollama
+    """Get or initialize local LLM agent (Ollama-based)."""
+    global local_llm_agent
+    if local_llm_agent is None:
+        local_llm_agent = LocalLLMAgent()
+    return local_llm_agent
 
 
 def get_drive_handler() -> DriveHandler:
@@ -598,7 +688,7 @@ def get_admin_commands() -> AdminCommands:
     """Get or initialize admin commands handler."""
     global admin_commands
     if admin_commands is None:
-        admin_commands = AdminCommands(get_db(), get_groq_agent())
+        admin_commands = AdminCommands(get_db(), get_local_llm_agent())  # LOCAL SHIFT 2026-03-12
     return admin_commands
 
 
@@ -617,7 +707,7 @@ def daily_anomaly_check():
         activity_logger.logger.info("▶ Starting daily anomaly check...")
         detector = get_anomaly_detector()
         db_instance = get_db()
-        agent = get_groq_agent()
+        agent = get_local_llm_agent()  # LOCAL SHIFT 2026-03-12
 
         # Run batch anomaly detection
         anomalies = detector.detect_batch()
@@ -730,7 +820,7 @@ def extract_and_embed_file(file_id: str, file_name: str, mime_type: str, user_id
                         'file_type': file_type,
                         'file_name': file_name,
                         'file_id': file_id,
-                        'extracted_at': datetime.now(tz=timezone('Asia/Bangkok')).isoformat(),
+                        'extracted_at': datetime.now(tz=BKK_TZ).isoformat(),
                         'chunk_index': i
                     }
                 )
@@ -1033,13 +1123,14 @@ def validate_startup() -> bool:
         print(f"  FAIL line-bot-sdk: {e}")
         checks_failed += 1
 
-    try:
-        import groq
-        print("  OK groq")
-        checks_passed += 1
-    except ImportError as e:
-        print(f"  FAIL groq: {e}")
-        checks_failed += 1
+    # LOCAL OLLAMA FIXED 2026-03-12: Groq no longer required (using local Ollama)
+    # try:
+    #     import groq
+    #     print("  OK groq")
+    #     checks_passed += 1
+    # except ImportError as e:
+    #     print(f"  FAIL groq: {e}")
+    #     checks_failed += 1
 
     try:
         import googleapiclient.discovery
@@ -1149,12 +1240,18 @@ async def health_check() -> Dict[str, Any]:
     try:
         process = psutil.Process()
         mem_info = process.memory_info()
+        
+        # LOCAL SHIFT 2026-03-12: Include inference device info
+        inference_device = get_inference_device()
+        llm_status = "ready" if get_local_llm_agent() else "error"
 
         return ORJSONResponse({
             "status": "ok",
             "timestamp": datetime.now().isoformat(),
             "memory_mb": mem_info.rss / 1024 / 1024,
             "cpu_percent": process.cpu_percent(interval=0.1),
+            "inference_device": inference_device,  # e.g., "cuda (RTX 1650)" or "cpu"
+            "llm_status": llm_status,  # Ollama connectivity
         })
     except Exception as e:
         return ORJSONResponse(
@@ -1214,7 +1311,7 @@ def handle_message(event: MessageEvent):
         )
 
         db_instance = get_db()
-        agent = get_groq_agent()
+        agent = get_local_llm_agent()  # LOCAL SHIFT 2026-03-12: Local LLM
         admin_cmd = get_admin_commands()
         emp_cmd = get_employee_commands()
 
@@ -1236,7 +1333,7 @@ def handle_message(event: MessageEvent):
             )
             return
 
-        # Classify intent using Groq
+        # Classify intent using local LLM (Ollama) - LOCAL SHIFT 2026-03-12
         intent_result = agent.classify_intent(
             user_message=user_message,
             user_name=user.get("display_name", "User"),
@@ -1244,8 +1341,27 @@ def handle_message(event: MessageEvent):
         )
 
         intent = intent_result.get("intent", "other")
+        confidence = intent_result.get("confidence", 0.0)
         requires_pin = intent_result.get("requires_pin", False)
         reply_text = intent_result.get("reply_text", "")
+
+        # LOCAL SHIFT 2026-03-12: Embed all messages for internal AI learning
+        embed_message(
+            text=user_message,
+            user_id=user_id,
+            metadata={
+                'intent': intent,
+                'material': intent_result.get("parameters", {}).get("material", ""),
+                'quantity': intent_result.get("parameters", {}).get("quantity", 0),
+                'timestamp': datetime.now(tz=BKK_TZ).isoformat()
+            }
+        )
+
+        # LOCAL SHIFT 2026-03-12: Check if we should suggest clarification (RL policy)
+        if suggest_interaction(user_id, intent, confidence):
+            # Send clarification suggestion (but not aggressively)
+            activity_logger.logger.debug(f"[RL] Suggesting clarification for: {user_id}")
+            # Could send help suggestions here, but mechanics are busy - stay silent
 
         # Route to appropriate handler
         if intent == "admin_command" or (is_admin and intent != "help"):
@@ -1403,14 +1519,72 @@ def handle_message(event: MessageEvent):
             pass
 
 
+
+def handle_image_message(event: MessageEvent) -> Optional[str]:
+    """
+    Stub: Handle image messages with OCR (Local Shift 2026-03-12).
+    Extract text from images → embed → classify intent.
+    
+    Currently: Just acknowledge. Future: EasyOCR for Thai text extraction.
+    """
+    try:
+        activity_logger.logger.info("[Image] Received image (stub - EasyOCR coming)")
+        # TODO: Download image from Line → EasyOCR(Thai) → text → embed + intent
+        return None  # Return extracted text or None if failed
+    except Exception as e:
+        activity_logger.logger.error(f"[Image] Error: {e}")
+        return None
+
+
+def handle_voice_message(event: MessageEvent) -> Optional[str]:
+    """
+    Stub: Handle voice messages with transcription (Local Shift 2026-03-12).
+    Extract audio → Vosk transcribe → classify intent.
+    
+    Currently: Just acknowledge. Future: Vosk for offline Thai speech-to-text.
+    """
+    try:
+        activity_logger.logger.info("[Voice] Received voice message (stub - Vosk coming)")
+        # TODO: Download audio from Line → Vosk(Thai) → text → embed + intent
+        return None  # Return transcribed text or None if failed
+    except Exception as e:
+        activity_logger.logger.error(f"[Voice] Error: {e}")
+        return None
+
+
 @webhook_handler.add(MessageEvent)
 def handle_other_message(event: MessageEvent):
-    """Catch-all for non-text messages"""
+    """
+    Catch-all for non-text messages (LOCAL SHIFT 2026-03-12).
+    Image/voice are stubs for future release.
+    """
     try:
+        message_type = getattr(event.message, 'type', 'unknown')
+        
+        if message_type == "image":
+            extracted_text = handle_image_message(event)
+            if extracted_text:
+                # Could process extracted_text here in future
+                pass
+            # For now, just acknowledge
+            reply = "🖼️ ขอบคุณที่ส่งรูป! อยู่ระหว่างพัฒนาฟีเจอร์ (Image OCR coming soon)"
+        
+        elif message_type == "audio":
+            extracted_text = handle_voice_message(event)
+            if extracted_text:
+                # Could process extracted_text here in future
+                pass
+            # For now, just acknowledge
+            reply = "🎙️ ขอบคุณที่ส่งเสียง! อยู่ระหว่างพัฒนาฟีเจอร์ (Voice recognition coming soon)"
+        
+        else:
+            # Unsupported type
+            reply = f"📎 กรุณาส่งข้อความตัวหนังสือเท่านั้นนะครับ (รับยกเว้น: รูป, เสียง ในอนาคต)"
+        
         messaging_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text="📎 กรุณาส่งข้อความตัวหนังสือเท่านั้นนะครับ")]
+                messages=[TextMessage(text=reply)]
             )
         )
     except Exception as e:

@@ -52,9 +52,9 @@ class Config:
     # ==================== SECURITY ====================
     SUPER_ADMIN_PIN: str = os.getenv("SUPER_ADMIN_PIN", "7482")
 
-    # ==================== GROQ CLOUD ====================
-    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-    GROQ_MODEL: str = "llama-3.1-8b-instant"  # Fast & low token usage
+    # ==================== GROQ CLOUD (DEPRECATED - Using local Ollama instead) ====================
+    # GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")  # LOCAL OLLAMA FIXED 2026-03-12: No longer used
+    # GROQ_MODEL: str = "llama-3.1-8b-instant"  # Deprecated
 
     # ==================== GOOGLE DRIVE ====================
     GOOGLE_SERVICE_ACCOUNT_JSON: Optional[str] = os.getenv(
@@ -157,8 +157,9 @@ class Config:
             errors.append("LINE_CHANNEL_ACCESS_TOKEN is required")
         if not cls.LINE_SUPER_ADMIN_ID:
             errors.append("LINE_SUPER_ADMIN_ID is required")
-        if not cls.GROQ_API_KEY:
-            errors.append("GROQ_API_KEY is required")
+        # LOCAL OLLAMA FIXED 2026-03-12: GROQ no longer required (using local Ollama)
+        # if not cls.GROQ_API_KEY:
+        #     errors.append("GROQ_API_KEY is required")
         if len(cls.SUPER_ADMIN_PIN) < 4 or len(cls.SUPER_ADMIN_PIN) > 6:
             errors.append("SUPER_ADMIN_PIN must be 4-6 digits")
 

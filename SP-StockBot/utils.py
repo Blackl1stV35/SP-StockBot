@@ -9,7 +9,7 @@ import json
 import io
 import logging
 from typing import Dict, List, Any, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -36,8 +36,8 @@ except ImportError:
 
 from logger import activity_logger
 
-# Bangkok timezone for all timestamps
-BANGKOK_TZ = timezone(datetime.now(timezone.utc).astimezone().utcoffset())
+# LOCAL OLLAMA FIXED 2026-03-12: Bangkok timezone for all timestamps
+BANGKOK_TZ = timezone(timedelta(hours=7))
 
 
 def parse_quantity(text: str) -> int:

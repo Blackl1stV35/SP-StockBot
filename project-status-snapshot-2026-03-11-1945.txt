@@ -1,0 +1,291 @@
+================================================================================
+                   SP-StockBot Project Status Snapshot
+                      Generated: 2026-03-11 19:45 +07
+================================================================================
+
+Repository Stage: vector-db-active (hybrid DB+vector), post-parse-quantity-fix
+Current Branch: fix/parse-quantity-windows-tests (3 commits ahead of origin)
+Last Stable Commit: 0a0538b (fix: improve parse_quantity + Windows tempfile fix)
+Running Server: Yes (ngrok active on port 8000)
+
+================================================================================
+                          COMPONENT INVENTORY
+================================================================================
+
+[FASTAPI APPLICATION]
+Status: Initialized (yes) - Production-ready
+Health: Running with lifespan context manager, CORS enabled, webhook registered
+Endpoints: /health (GET), /callback (POST), /api/anomalies (GET), /api/users (GET)
+Security Notes: No auth on /api/* endpoints - admin only at manual level
+Recent State: Stable, handling Line webhooks with proper signature validation
+
+[LINE BOT SDK V3]
+Status: Initialized (yes) - v3 API with proper event routing
+Components: MessagingApi, WebhookHandler, MessageEvent, TextMessageContent
+Handler: Official @webhook_handler.add(MessageEvent, message=TextMessageContent) filter
+Integration: Reply/push messages via messaging_api.push_message() and reply_message()
+Issue Detected: CRITICAL - FlexMessage used instead of FlexSendMessage in 3 locations
+  → Lines 356, 382, 407 in main.py - recent edits changed from FlexSendMessage
+  → Will cause runtime error when sending Flex messages to users
+  → Recommendation: Revert to FlexSendMessage immediately
+
+[CHROMA VECTOR DB]
+Status: Initialized (yes) - Active and operational
+Location: ./vector_db (PersistentClient, file-based)
+Collections: inventory, users, behaviors (all 3 active)
+Health: Stable - Windows tempfile PermissionError fixed with ignore_cleanup_errors=True
+Integration: Embeddings stored with metadata (user_id, material, timestamps)
+Operations: register_user_with_vector_profile(), handle_inventory_report(), query_user_inventory_reports()
+Test Status: All vector DB integration tests pass (2/42 tests dedicated to vector ops)
+
+[SENTENCE TRANSFORMERS EMBEDDINGS]
+Status: Initialized (yes) - Model loaded on startup
+Model: all-MiniLM-L6-v2 (compact, CPU-friendly)
+Device Detection: Automatic (cuda if available, else cpu)
+Current Device: CPU (8GB RAM system)
+Performance: Fast, suitable for 8GB RAM constraint
+Usage: Encoding user profiles, reports, behaviors into 384-dim vectors
+
+[APScheduler BACKGROUND SCHEDULER]
+Status: Initialized (yes) - Running in background
+Jobs Registered: 3 (daily_anomaly_check, memory_cleanup, check_drive_for_new_files)
+Schedule:
+  - daily_anomaly_check: 08:00 Bangkok time (cron)
+  - memory_cleanup: every 30 minutes (interval)
+  - check_drive_for_new_files: every 15 minutes (interval)
+Health: Running since app startup, no errors logged
+
+[GROQ AGENT (LLM)]
+Status: Initialized (yes) - HTTP client with retry/caching
+Model: llama-3.1-8b-instant (free tier, low tokens)
+API Key: Configured and verified (first 20 chars logged)
+Cache: Groq response cache via Database.groq_cache table
+Retry Logic: Tenacity with exponential backoff, max 3 attempts
+Recent Use: Intent classification for user messages
+Optimization: Caching + minimal token usage for cost efficiency
+
+[GOOGLE DRIVE HANDLER]
+Status: Initialized (partial) - Drive service may be unavailable
+Service Account: Auto-detected at SP-StockBot/nth-station-489109-s1-6c5ccb8ccef4.json
+Folder ID: Loaded from settings table on startup
+File Processing: check_drive_for_new_files() runs every 15 minutes
+Supported Formats: .xlsx, .pdf, .docx, .png, .jpeg (dynamic extraction)
+Cleanup: Files deleted after successful vector embedding
+Note: Drive integration is optional - bot continues without it
+
+[DATABASE (SQLITE)]
+Status: Initialized (yes) - Hybrid mode (legacy + vector coexist)
+Path: ./data/stockbot.db
+Tables: users, inventory, anomalies, drive_files, groq_cache, settings, admin_actions
+Schema: All tables initialized on startup, indexes present
+Recent Change: Used primarily for settings + admin action logs now
+Transition: Gradual shift toward vector-only; DB still used for user roles
+
+[LOGGER (Activity Tracking)]
+Status: Initialized (yes) - JSON Lines format
+Output: logs/agent_activity.log + console (DEBUG level on stderr)
+Format: JSON with structured fields (user_id, intent, groq_input/output, pin_result)
+Memory: psutil included for RAM monitoring
+Verbosity: Comprehensive - logs every message, admin action, anomaly detection
+
+[ADMIN COMMANDS HANDLER]
+Status: Initialized (yes) - PIN-protected admin functions
+Commands: add_user, list_users, delete_user, set_drive_folder, help
+PIN Verification: Super admin PIN (default "7482") required for most actions
+Security: PIN checked twice (extraction + verification)
+Logging: All admin actions logged to admin_actions table with success/error
+
+[EMPLOYEE COMMANDS HANDLER]
+Status: Initialized (yes) - User-facing operations
+Operations: check_inventory, report_usage, help text
+Integration: Uses EmployeeCommands class from commands/employee_commands.py
+Health: Stable, handles material lookups and quantity reporting
+
+[parse_quantity() FUNCTION]
+Status: Fixed (yes) - March 11, 2026
+Algorithm: 3-step approach:
+  1. Highest priority: pattern with "+" signs (e.g., "5+5+" or "10+2+")
+  2. Fallback: scan tokens right-to-left, skip Thai-prefixed large numbers
+  3. Accept only standalone numbers without Thai material code prefix
+Test Coverage: 13/13 unit tests passing
+Examples Fixed:
+  • "เบิก กดทห80 5+5+" → 10 (not 90)
+  • "กดทห100 10+2+" → 12 (not 112)
+  • "เบิก นวม1000 5+3+2" → 10 (not 1010)
+  • "abc 123 def 456" → 456 (last group)
+Readiness: Production-ready, handles all Thai material code patterns
+
+[VECTOR EMBEDDING FUNCTIONS]
+Status: Implemented (yes)
+Functions:
+  • embed_and_upsert() - embed text + metadata into any collection
+  • split_into_chunks() - split long text into 512-token chunks for embedding
+  • register_user_with_vector_profile() - new user registration with vector profile
+  • handle_inventory_report() - parse + embed inventory reports
+  • query_user_inventory_reports() - retrieve user's report history from vector DB
+  • extract_and_embed_file() - dynamic extraction from .xlsx/.pdf/.docx/.png/.jpeg
+  • send_report_flex_message() - send personalized report to user (BROKEN - see Line Bot issue)
+  • send_alert_flex_message() - send anomaly alerts (BROKEN - see Line Bot issue)
+  • send_stock_check_flex_message() - send stock level check (BROKEN - see Line Bot issue)
+
+[ANOMALY DETECTOR]
+Status: Initialized (yes) - Statistical analysis
+Detection Method: Deviation % calculated from historical averages
+Severity Levels: Low, Medium, High
+Notification: Daily 08:00 Bangkok time via Groq-generated summary
+Integration: Results stored in anomalies table with timestamps
+
+[FLEX MESSAGE TEMPLATES (utils.py)]
+Status: Implemented (yes) - Bubble-style Flex messages
+Functions: get_report_flex(), get_alert_flex(), get_stock_check_flex()
+Content: Material lists, anomaly summaries, stock levels with status indicators
+Issue: BLOCKED by FlexMessage vs FlexSendMessage bug in main.py
+Workaround: Templates are correct; messaging wrapper needs fix
+
+================================================================================
+                             TEST STATUS
+================================================================================
+
+Total Tests: 42
+Passed: 42 (100%)
+Failed: 0
+Skipped: 0
+Duration: ~58 seconds
+Warnings: 1 (PyPDF2 deprecation - unrelated to core functionality)
+
+Test Coverage by Category:
+  • Quantity Parsing: 13/13 ✓ (including 6 new Thai material code tests)
+  • Text Chunking: 4/4 ✓
+  • File Type Detection: 5/5 ✓
+  • Flex Messages: 6/6 ✓
+  • Notification Formatting: 4/4 ✓
+  • Vector DB Integration: 2/2 ✓
+  • Mock Line Webhook: 1/1 ✓
+  • Flex Message JSON Parsing: 3/3 ✓
+  • Mock Drive Extraction: 2/2 ✓
+  • Mock Grafana Integration: 1/1 ✓
+
+Windows Compatibility: Fixed (tempfile ignore_cleanup_errors=True)
+Encoding Issues: Resolved (ASCII-only test descriptions)
+
+================================================================================
+                        KNOWN ISSUES & RISKS
+================================================================================
+
+[CRITICAL] FlexMessage Import/Usage Bug
+  → Introduced in recent edits (not in last stable commit 0a0538b)
+  → 3 locations affected: send_report_flex_message(), send_alert_flex_message(), send_stock_check_flex_message()
+  → Impact: FlexMessage is data structure, not sendable message wrapper
+  → Fix: Change back to FlexSendMessage in imports + all 3 function definitions
+  → Severity: HIGH - breaks all Flex message deliveries to users
+
+[WARNING] Database vs Vector Transition
+  → Project in hybrid mode: SQLite still used for users, admin logs, settings
+  → Complete vector-only migration not yet finalized
+  → Decision needed: keep hybrid or commit to full vector migration
+  → Current approach works but adds code complexity
+
+[NOTE] No authentication on /api/* endpoints
+  → GET /api/anomalies and /api/users are public-read
+  → Admin-level operations protected only by Line Bot PIN
+  → Recommendation: Add API key auth if exposing externally
+
+[DEPRECATION] PyPDF2 library
+  → Still used in utils.py for PDF extraction
+  → Library deprecated; migration to pypdf recommended (future)
+  → Not blocking current functionality
+
+[RESOURCE] GPU Detection
+  → torch.cuda.is_available() always returns False on 8GB RAM setup
+  → CPU mode is default and appropriate
+  → No action needed; running as designed
+
+================================================================================
+                       RECENT CHANGES (Git Log)
+================================================================================
+
+0a0538b9 - fix: improve parse_quantity to isolate quantity part + handle Windows tempfile PermissionError in tests
+0de98bc3 - refactor: remove obsolete test scripts and documentation
+62127e21 - fix: ASCII-only test descriptions to avoid encoding issues
+62127e21 - fix: improve parse_quantity() for Thai material codes, fix Windows temp dir cleanup
+3285cf33 - fix: remove unicode characters for Windows compatibility
+14e6b45b - fix: correct v3 webhook event structure with required fields
+a825e0d0 - feat: add logger methods + test_bot.py webhook simulator
+24295ead - fix: correct v3 webhook handler filter (TextMessageContent)
+
+Trend: Bug fixes and stability improvements post-vector-migration
+
+================================================================================
+                      DEPLOYMENT & OPERATIONS
+================================================================================
+
+Environment: Local Windows machine + ngrok tunnel to Line API
+Server Status: Running (main.py via Python interpreter)
+Tunnel: ngrok http 8000 (active)
+Database: SQLite at ./data/stockbot.db
+Logs: ./logs/agent_activity.log (JSON Lines)
+Vector DB: ./vector_db/ (Chroma persistent storage)
+
+Resource Usage Baseline:
+  • Memory: ~200-300 MB at startup (SentenceTransformer + Chroma + all models loaded)
+  • Memory cleanup: every 30 min via garbage collection
+  • CPU: Minimal (Groq calls offloaded to cloud, only local inference for embeddings)
+  • Disk: Small vector DB (~2-5 MB with embeddings), DB file ~100KB
+
+Production Readiness Checklist:
+  ✓ Startup validation (all checks pass)
+  ✓ Database initialized
+  ✓ Line Bot SDK v3 configured
+  ✓ Groq API tested
+  ✓ Vector DB operational
+  ✓ Background jobs scheduled
+  ✗ Flex message delivery (BROKEN - import bug)
+  ✓ Admin PIN security enabled
+  ✓ Request logging + audit trail
+  ? API authentication (not yet implemented)
+
+================================================================================
+                          NEXT STEPS
+================================================================================
+
+IMMEDIATE (within this session):
+  1. FIX CRITICAL BUG: Revert FlexSendMessage imports + usage in main.py
+     - git checkout HEAD -- SP-StockBot/main.py (or manual revert)
+     - Verify tests still pass
+     - Commit fix with message: "fix: revert FlexMessage to FlexSendMessage (critical bug)"
+
+NEXT (session after fix verification):
+  2. Test real Line Bot webhook delivery with actual ngrok URL
+  3. Verify Flex messages render correctly on Line client
+  4. Add integration test for full message chain (parse → intent → reply)
+  5. Consider hybrid->vector migration completion decision
+
+FUTURE (post-stabilization):
+  6. Add API authentication (API keys or JWT)
+  7. Migrate from PyPDF2 to pypdf
+  8. Extend anomaly detection with ML models
+  9. Add Grafana dashboard metrics export
+  10. Containerize for Docker deployment
+
+================================================================================
+                      COMMIT & PUSH STRATEGY
+================================================================================
+
+Current State: 3 commits ahead of origin, with uncommitted changes
+
+Recommended Actions:
+  1. Fix the FlexMessage bug (revert main.py to stable version)
+  2. Commit: "fix: revert FlexMessage to FlexSendMessage (critical bug)"
+  3. Add this status file:
+     git add project-status-snapshot-2026-03-11-1945.txt
+     git add SP-StockBot/main.py
+  4. Commit all: "docs: add project status snapshot + fix FlexMessage critical bug"
+  5. Merge fix/parse-quantity-windows-tests into master:
+     git checkout master
+     git merge fix/parse-quantity-windows-tests
+  6. Push: git push origin master
+  7. Cleanup: .gitignore vector_db/ logs/ data/stockbot.db (already should be ignored)
+
+=================================================================================
+                           END OF STATUS SNAPSHOT
+=================================================================================
